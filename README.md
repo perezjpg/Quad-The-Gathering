@@ -9,7 +9,7 @@ Pega links de decks (Archidekt, Moxfield, …), revisa el análisis del pod y ju
 
 ```bash
 npm start          # http://localhost:3000  (Node 18+, sin dependencias)
-npm test           # parser, importadores y motor de juego
+npm test           # parser, importadores y 30+ tests de reglas (CR)
 ```
 
 1. Elige 2, 3 o 4 jugadores.
@@ -41,23 +41,16 @@ npm test           # parser, importadores y motor de juego
 - Selector de comandante cuando el sitio no lo marca
 - **🔗 Compartir pod**: copia un link con nombres y URLs de los decks
 
-**Mesa**
-- Zonas: biblioteca, mano, campo de batalla (criaturas / otros / tierras agrupadas), cementerio, exilio y **zona de mando** con impuesto de comandante
-- Vida 40, **daño de comandante** (21 es letal), eliminación por biblioteca vacía
-- Tu turno: toca una carta para jugarla, lanzarla, girarla (doble clic), sacrificarla, exiliarla o verla en grande
-- **⚔ Combate** con selección de atacantes y objetivo; los oponentes bloquean solos
-- **🤖 IA juega por mí** y velocidad de simulación (lenta → turbo) con pausa
-- Banners como en el video: `LAND DROP`, `CAST`, `COMMANDER`, `REMOVAL`, `BOARD WIPE`, `COMBAT`, `DAMAGE`
-- Registro completo de la partida
-
-## La IA / How the AI plays
-
-No es un motor de reglas completo. Lee el texto Oracle de cada carta y resuelve los efectos más comunes:
-
-- robar cartas, daño, ganar vida, destruir o exiliar objetivos, board wipes
-- buscar tierras básicas (ramp) y crear fichas de criatura
-
-En cada turno juega una tierra, prioriza ramp, después su comandante y luego las cartas más caras que pueda pagar. Ataca al oponente con menos vida y bloquea solo cuando le conviene. Los counterspells y los combos complejos se ignoran.
+**Mesa (sigue las Reglas Completas: ver [docs/REGLAS.md](docs/REGLAS.md))**
+- **Barra de pasos del turno** (CR 500): Untap → Upkeep → Draw → Main 1 → Combat → Main 2 → End → Cleanup
+- **Maná con colores** (CR 106/107.4): costes híbridos, pirexianos y {X}; reserva de maná que se vacía entre pasos; Command Tower y Signets
+- **La pila y la prioridad** (CR 405/117): cuando alguien lanza un hechizo puedes responder con instantáneos (por ejemplo, Counterspell), y la IA también contrarresta
+- **Tiempos**: una tierra por turno (305.2) y velocidad de conjuro (307.1). Si una jugada es ilegal, la app te dice qué regla la impide
+- **Combate en pasos** (CR 506–511): eliges a quién ataca cada criatura y declaras tus bloqueadores cuando te atacan. Hay first/double strike, menace, trample, deathtouch, lifelink, flying/reach, infect y más
+- **Acciones basadas en estado** (CR 704): leyenda, resistencia 0, veneno, 21 de daño de comandante, biblioteca vacía
+- **Commander** (CR 903): impuesto, vuelta a la zona de mando, 40 de vida y validación del deck (100 cartas, singleton, identidad de color)
+- **Disparadores**: "dies" (Blood Artist, Zulaport), ataque, mantenimiento y paso final; reemplazo de tokens (Chatterfang); "lords"
+- **🤖 IA juega por mí**, velocidad de simulación con pausa, banners como en el video y registro con números de regla
 
 ## Estructura / Layout
 
@@ -69,7 +62,9 @@ public/app.js          UI: setup, mesa, menús, modales
 public/lib/deckText.js parser de listas en texto (compartido servidor/cliente)
 public/lib/scryfall.js datos de cartas vía Scryfall /cards/collection
 public/lib/stats.js    análisis y bracket
-public/lib/engine.js   motor de partida + IA
+public/lib/engine.js   motor de reglas: turnos, pila, combate, SBA, disparadores, IA
+public/lib/mana.js     costes y pago de maná con colores
+docs/REGLAS.md         cobertura de las Reglas Completas
 public/lib/demo.js     4 decks demo
 test/                  node:test
 ```

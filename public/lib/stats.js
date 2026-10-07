@@ -49,7 +49,24 @@ export function analyze(entries) {
   const commanders = deck.filter((e) => e.board === 'commander');
   for (const e of commanders.length ? commanders : deck) e.info.colorIdentity.forEach((c) => ci.add(c));
 
+  // Construcción de Commander (CR 903.5): 100 cartas, singleton salvo tierras básicas
+  // o cartas que lo permiten, y todo dentro de la identidad de color del comandante (CR 903.5c / 903.4).
+  const commanderCI = new Set(commanders.flatMap((e) => e.info.colorIdentity));
+  const outOfIdentity = commanders.length
+    ? deck.filter((e) => e.board === 'main' && e.info.colorIdentity.some((c) => !commanderCI.has(c))).map((e) => e.info.name)
+    : [];
+  const duplicates = deck
+    .filter((e) => e.qty > 1 && !/Basic Land/.test(e.info.typeLine) && !/a deck can have any number of cards named/i.test(e.info.oracle || ''))
+    .map((e) => `${e.info.name} ×${e.qty}`);
+  const legality = [];
+  if (count !== 100) legality.push(`El deck tiene ${count} cartas; Commander exige exactamente 100 (CR 903.5a).`);
+  if (!commanders.length) legality.push('No hay comandante designado (CR 903.3).');
+  if (duplicates.length) legality.push(`Copias repetidas (singleton, CR 903.5b): ${duplicates.slice(0, 4).join(', ')}${duplicates.length > 4 ? '…' : ''}`);
+  if (outOfIdentity.length)
+    legality.push(`Fuera de la identidad de color (CR 903.5c): ${outOfIdentity.slice(0, 4).join(', ')}${outOfIdentity.length > 4 ? '…' : ''}`);
+
   return {
+    legality,
     count,
     avgMV: nonlandCount ? +(mvTotal / nonlandCount).toFixed(2) : 0,
     curve,

@@ -10,11 +10,12 @@ const SEAT_COLORS = ['#39c5bb', '#9b5de5', '#e63946', '#f4a261'];
 const SPEEDS = { lenta: 1300, normal: 750, rápida: 280, turbo: 40 };
 
 const state = {
+  busy: false,
   count: 4,
   seats: Array.from({ length: 4 }, (_, i) => newSeat(i)),
   game: null,
   you: 0, // asiento que se muestra abajo
-  settings: { speed: 'normal', autoBlock: true, showAIHands: false },
+  settings: { speed: 'normal', askResponses: true, showAIHands: false },
   looping: false,
   paused: false,
   simulate: false,
@@ -257,7 +258,7 @@ function seatCard(s, i) {
         <span>Ramp ${st.ramp}</span><span>Robo ${st.draw}</span><span>Removal ${st.removal}</span><span>Wipes ${st.wipes}</span><span>Tutores ${st.tutors}</span>
         ${st.gameChangers.length ? `<span class="gc" title="${esc(st.gameChangers.join(', '))}">Game Changers ${st.gameChangers.length}</span>` : ''}
       </div>
-      ${st.count !== 100 ? `<div class="warn small">El deck tiene ${st.count} cartas (Commander usa 100).</div>` : ''}
+      ${st.legality.map((w) => `<div class="warn small">⚖️ ${esc(w)}</div>`).join('')}
       ${st.missing.length ? `<div class="warn small">No encontradas en Scryfall: ${esc(st.missing.slice(0, 5).join(', '))}${st.missing.length > 5 ? '…' : ''}</div>` : ''}
       `
         : ''
@@ -267,7 +268,22 @@ function seatCard(s, i) {
 
 // ---------- Mesa ----------
 
+class Abort extends Error {}
+const pendingDecisions = new Set();
+
+/** Termina la partida actual: resuelve decisiones pendientes y detiene el motor de la partida vieja. */
+function abortGame() {
+  if (state.game) state.game.aborted = true;
+  for (const resolveDefault of [...pendingDecisions]) resolveDefault();
+  pendingDecisions.clear();
+  document.querySelectorAll('.modal-wrap, .menu').forEach((m) => m.remove());
+  state.looping = false;
+  state.busy = false;
+  state.paused = false;
+}
+
 function startGame(simulate) {
+  abortGame();
   seenCards.clear();
   const seats = state.seats.slice(0, state.count);
   state.simulate = simulate;
@@ -283,6 +299,7 @@ function startGame(simulate) {
   const human = state.game.players.findIndex((p) => !p.isAI);
   state.you = human >= 0 ? human : 0;
   state.paused = false;
+  state.busy = false;
   $('#setup').hidden = true;
   $('#table').hidden = false;
   document.body.classList.add('playing');
@@ -290,63 +307,80 @@ function startGame(simulate) {
   runLoop();
 }
 
-async function step(label, detail) {
-  state.game.banner = { label, detail, key: Math.random() };
-  renderTable();
-  const ms = SPEEDS[state.settings.speed] ?? 700;
-  await sleep(ms);
-  while (state.paused) await sleep(150);
-}
+/** Interfaz que el motor usa para animar y para pedir decisiones a jugadores humanos. */
+const io = {
+  async step(label, detail) {
+    const g = state.game;
+    if (!g) throw new Abort();
+    g.banner = { label, detail, key: Math.random() };
+    renderTable();
+    await sleep(SPEEDS[state.settings.speed] ?? 700);
+    while (state.paused && !g.aborted) await sleep(150);
+    if (g.aborted) throw new Abort();
+  },
+  chooseBlocks: (game, defender, attackers) => askBlocks(game, defender, attackers),
+  respond: (game, player, ctx, options) => (state.settings.askResponses ? askResponse(game, player, ctx, options) : null),
+  chooseDiscard: (game, player, n) => askDiscard(game, player, n),
+};
 
 async function runLoop() {
   if (state.looping) return;
   state.looping = true;
+  const g = state.game;
   try {
-    const g = state.game;
     while (g && g === state.game && g.winner == null) {
       const p = g.players[g.active];
       if (p.isAI) {
-        await E.aiTurn(g, step);
-        if (g.turn > 60) {
-          E.log(g, '⏱ Límite de 60 turnos alcanzado.');
+        await E.aiTurn(g, io);
+        if (g.turn > 80) {
+          E.log(g, '⏱ Límite de 80 rondas alcanzado.');
           break;
         }
       } else {
-        E.startTurn(g);
-        g.banner = { label: 'TU TURNO', detail: p.name, key: Math.random() };
-        g.humanTurnStarted = true;
-        renderTable();
+        if (g.step === 'untap') await E.beginTurn(g, io);
+        if (g === state.game) g.banner = { label: 'TU TURNO', detail: `${p.name} · Main 1`, key: Math.random() };
         break; // esperar acciones del humano
       }
     }
+  } catch (err) {
+    if (!(err instanceof Abort) && !g?.aborted) {
+      console.error(err);
+      toast(`Error del motor: ${err.message}`);
+    }
   } finally {
-    state.looping = false;
-    renderTable();
+    if (g === state.game) {
+      state.looping = false;
+      renderTable();
+    }
   }
 }
 
-function endHumanTurn() {
+/** Ejecuta una acción del humano bloqueando la UI mientras el motor resuelve. */
+async function humanAction(fn) {
+  if (state.busy || state.looping || !state.game) return;
   const g = state.game;
-  const p = g.players[g.active];
-  if (p.isAI || g.winner != null) return;
-  while (p.hand.length > 7) E.moveCard(g, p.hand[0], 'graveyard');
-  E.endTurn(g);
-  runLoop();
-}
-
-async function aiPlayForMe() {
-  const g = state.game;
-  const p = g.players[g.active];
-  if (p.isAI || state.looping) return;
-  state.looping = true;
+  state.busy = true;
+  renderTable();
   try {
-    // El turno humano ya hizo untap/draw, así que la IA continúa desde la fase principal.
-    await E.aiTurn(g, step, { skipStart: true });
+    await fn();
+  } catch (err) {
+    if (!(err instanceof Abort) && !g.aborted) {
+      console.error(err);
+      toast(err.message);
+    }
   } finally {
-    state.looping = false;
+    if (g === state.game) {
+      state.busy = false;
+      renderTable();
+    }
   }
-  runLoop();
+  if (g === state.game && g.winner == null && g.players[g.active].isAI) runLoop();
 }
+
+const isHumanTurn = () => {
+  const g = state.game;
+  return g && g.winner == null && !g.players[g.active].isAI && !state.looping && !state.busy;
+};
 
 // ---------- Render: Mesa ----------
 
@@ -355,18 +389,27 @@ const seenCards = new Set();
 
 function cardHTML(c, { small = false, owner = null, zone = '', hidden = false, count = 0 } = {}) {
   if (hidden) return `<div class="card back ${small ? 'sm' : ''}"></div>`;
+  const g = state.game;
   const seenKey = `${c.iid}:${zone}`;
   const fresh = !seenCards.has(seenKey);
   seenCards.add(seenKey);
-  const pt =
-    isCreature(c) && c.power != null
-      ? `<span class="pt ${c.damage ? 'hurt' : ''}">${esc(c.power)}/${esc(c.toughness)}${c.damage ? ` <s>-${c.damage}</s>` : ''}</span>`
-      : '';
+  let pt = '';
+  if (isCreature(c) && c.power != null) {
+    const pw = zone === 'battlefield' ? E.power(g, c) : c.power;
+    const tg = zone === 'battlefield' ? E.toughness(g, c) : c.toughness;
+    const buffed = zone === 'battlefield' && (pw !== parseInt(c.power, 10) || tg !== parseInt(c.toughness, 10));
+    pt = `<span class="pt ${c.damage ? 'hurt' : ''} ${buffed ? 'buffed' : ''}">${esc(pw)}/${esc(tg)}${c.damage ? ` <s>-${c.damage}</s>` : ''}</span>`;
+  }
   const img = c.imgSmall
     ? `<img src="${esc(c.imgSmall)}" alt="${esc(c.name)}" loading="lazy" draggable="false">`
     : `<div class="text-card"><b>${esc(c.name)}</b><small>${esc(c.typeLine)}</small></div>`;
-  return `<div class="card ${small ? 'sm' : ''} ${c.tapped ? 'tapped' : ''} ${c.sick && isCreature(c) && zone === 'battlefield' ? 'sick' : ''} ${c.isCommander ? 'commander' : ''} ${c.isToken ? 'token' : ''} ${fresh ? 'fresh' : ''}"
-    data-iid="${c.iid}" data-zone="${zone}" data-owner="${owner}" title="${esc(c.name)}" tabindex="0">${img}${pt}${count > 1 ? `<span class="stack">×${count}</span>` : ''}</div>`;
+  const cls = [
+    'card', small && 'sm', c.tapped && 'tapped', c.sick && isCreature(c) && zone === 'battlefield' && !E.has(c, 'haste') && 'sick',
+    c.isCommander && 'commander', c.isToken && 'token', fresh && 'fresh',
+  ].filter(Boolean).join(' ');
+  return `<div class="${cls}" data-iid="${c.iid}" data-zone="${zone}" data-owner="${owner}" title="${esc(c.name)}" tabindex="0">${img}${pt}${
+    count > 1 ? `<span class="stack">×${count}</span>` : ''
+  }</div>`;
 }
 
 function groupLands(cards) {
@@ -379,6 +422,19 @@ function groupLands(cards) {
   return [...groups.values()];
 }
 
+const COLOR_EMOJI = { W: '☀', U: '💧', B: '💀', R: '🔥', G: '🌳', C: '◇', '*': '✦' };
+
+function manaBadge(p) {
+  const g = state.game;
+  const sources = E.sourcesOf(p);
+  const total = sources.reduce((n, s) => n + Math.max(...s.options.map((o) => o.length)), 0);
+  const colors = new Set(sources.flatMap((s) => s.options.flat()));
+  const pool = g.pools[p.idx];
+  return `<span class="mana-badge" title="Maná disponible (fuentes sin girar) y reserva de maná (CR 106.4)">💎 ${total}
+    <span class="mana-colors">${['W', 'U', 'B', 'R', 'G', 'C'].filter((c) => colors.has(c) || (c !== 'C' && colors.has('*'))).map((c) => COLOR_EMOJI[c]).join('')}</span>
+    ${pool.length ? `<span class="pool">reserva: ${pool.map((u) => COLOR_EMOJI[u]).join('')}</span>` : ''}</span>`;
+}
+
 function matHTML(p, { isYou }) {
   const g = state.game;
   const active = g.active === p.idx && g.winner == null;
@@ -387,7 +443,7 @@ function matHTML(p, { isYou }) {
   const others = p.battlefield.filter((c) => !isLand(c) && !isCreature(c));
   const small = !isYou;
   const cmdDmg = Object.entries(p.commanderDamage).filter(([, v]) => v > 0);
-  const showHand = isYou || state.settings.showAIHands;
+  const showHand = (isYou && (!p.isAI || state.simulate)) || state.settings.showAIHands;
   return `
   <section class="mat ${isYou ? 'you' : 'opp'} ${active ? 'active' : ''} ${p.alive ? '' : 'dead'} ${g.winner === p.idx ? 'winner' : ''}" style="--pc:${p.color}" data-player="${p.idx}">
     <div class="mat-head">
@@ -397,7 +453,9 @@ function matHTML(p, { isYou }) {
         <span class="life ${p.life <= 10 ? 'low' : ''}">${p.life}</span>
         <button class="life-btn" data-life="1" data-p="${p.idx}" aria-label="Sumar vida">+</button>
       </span>
-      ${cmdDmg.length ? `<span class="cmd-dmg" title="Daño de comandante recibido">🗡 ${cmdDmg.map(([, v]) => v).join(' / ')}</span>` : ''}
+      ${p.poison ? `<span class="poison" title="Contadores de veneno (10 = derrota, CR 704.5c)">☠ ${p.poison}</span>` : ''}
+      ${cmdDmg.length ? `<span class="cmd-dmg" title="Daño de combate de comandante recibido (21 = derrota)">🗡 ${cmdDmg.map(([, v]) => v).join(' / ')}</span>` : ''}
+      ${p.alive ? manaBadge(p) : ''}
       <span class="zones">
         <span title="Biblioteca">📚 ${p.library.length}</span>
         <span title="Mano">✋ ${p.hand.length}</span>
@@ -408,7 +466,7 @@ function matHTML(p, { isYou }) {
     <div class="mat-body">
       <div class="command-zone">
         <span class="cz-label">COMMAND ZONE</span>
-        ${p.command.map((c) => `${cardHTML(c, { small, owner: p.idx, zone: 'command' })}${p.commanderTax[c.iid] ? `<span class="tax">+${p.commanderTax[c.iid]}</span>` : ''}`).join('')}
+        ${p.command.map((c) => `${cardHTML(c, { small, owner: p.idx, zone: 'command' })}${p.commanderTax[c.iid] ? `<span class="tax" title="Impuesto de comandante (CR 903.8)">+${p.commanderTax[c.iid]}</span>` : ''}`).join('')}
       </div>
       <div class="field">
         <div class="row creatures">${creatures.map((c) => cardHTML(c, { small, owner: p.idx, zone: 'battlefield' })).join('')}</div>
@@ -434,6 +492,13 @@ function matHTML(p, { isYou }) {
   </section>`;
 }
 
+function stepBarHTML(g) {
+  const idx = E.STEPS.findIndex((s) => s.id === g.step);
+  return `<ol class="steps" aria-label="Paso del turno">${E.STEPS.map(
+    (s, i) => `<li class="${i === idx ? 'on' : i < idx ? 'done' : ''}" title="CR ${s.cr}">${s.label}</li>`
+  ).join('')}</ol>`;
+}
+
 function renderTable() {
   const g = state.game;
   if (!g) return;
@@ -441,8 +506,9 @@ function renderTable() {
   const you = g.players[state.you];
   const opps = g.players.filter((p) => p !== you);
   const activeP = g.players[g.active];
-  const humanTurn = !activeP.isAI && g.winner == null && !state.looping;
+  const humanTurn = isHumanTurn();
   const b = g.banner;
+  const inMain = g.step === 'main1' || g.step === 'main2';
 
   root.innerHTML = `
     <header class="table-head">
@@ -453,10 +519,12 @@ function renderTable() {
           ${Object.keys(SPEEDS).map((k) => `<option value="${k}" ${state.settings.speed === k ? 'selected' : ''}>⏱ ${k}</option>`).join('')}
         </select>
         ${state.looping ? `<button class="btn ghost small" data-act="pause">${state.paused ? '▶ Seguir' : '❚❚ Pausa'}</button>` : ''}
+        ${!state.simulate ? `<button class="btn ghost small" data-act="toggle-resp" title="Pedirte responder con instantáneos cuando tengas prioridad (CR 117)">${state.settings.askResponses ? '🛎 Prioridad' : '🔕 Prioridad'}</button>` : ''}
       </div>
     </header>
     <div class="opps n${opps.length}">${opps.map((p) => matHTML(p, { isYou: false })).join('')}</div>
     <div class="center">
+      ${stepBarHTML(g)}
       ${
         g.winner != null
           ? `<div class="banner win">🏆 ${esc(g.players[g.winner].name)} GANA</div>`
@@ -464,27 +532,26 @@ function renderTable() {
             ? `<div class="banner" data-k="${b.key}"><span>${esc(b.label)}</span>${b.detail ? `<small>${esc(b.detail)}</small>` : ''}</div>`
             : ''
       }
+      ${g.stack.length ? `<div class="stack-zone" title="La pila (CR 405)">PILA: ${g.stack.map((it) => esc(it.card.name)).join(' ← ')}</div>` : ''}
       <div class="turn-line" style="--pc:${activeP.color}"></div>
       <details class="log"><summary>Registro (${g.log.length})</summary><ol>${g.log
-        .slice(0, 60)
+        .slice(0, 80)
         .map((l) => `<li><b>T${l.turn}</b> ${esc(l.msg)}</li>`)
         .join('')}</ol></details>
     </div>
     ${matHTML(you, { isYou: true })}
-    <nav class="toolbar ${humanTurn ? '' : 'disabled'}">
+    <nav class="toolbar">
       ${
         g.winner != null
           ? `<button class="btn primary" data-act="rematch">↻ Revancha</button><button class="btn ghost" data-act="back">Volver al setup</button>`
           : humanTurn
             ? `
-        <span class="mana">💎 ${E.availableMana(activeP)} maná</span>
-        <button class="btn small" data-act="draw">Robar</button>
-        <button class="btn small" data-act="combat">⚔ Combate</button>
-        ${g.turn === 1 && activeP.landsPlayed === 0 && activeP.battlefield.length === 0 ? `<button class="btn small ghost" data-act="mulligan">Mulligan</button>` : ''}
-        <button class="btn small ghost" data-act="shuffle">Barajar</button>
+        <span class="mana">${esc(E.STEPS.find((s) => s.id === g.step)?.label || '')}</span>
+        ${g.step === 'main1' ? `<button class="btn small" data-act="combat">⚔ Combate</button>` : ''}
+        ${activeP.turnsTaken === 1 && activeP.landsPlayed === 0 && activeP.battlefield.length === 0 && inMain ? `<button class="btn small ghost" data-act="mulligan">Mulligan</button>` : ''}
         <button class="btn small ghost" data-act="ai-me">🤖 IA juega por mí</button>
         <button class="btn small primary" data-act="end-turn">Pasar turno ⏭</button>`
-            : `<span class="mana">${esc(activeP.name)} está jugando…</span>`
+            : `<span class="mana">${state.busy ? 'Resolviendo…' : `${esc(activeP.name)} está jugando…`}</span>`
       }
     </nav>
   `;
@@ -493,14 +560,16 @@ function renderTable() {
 // ---------- Popovers / modales ----------
 
 function closeMenus() {
-  document.querySelectorAll('.menu, .modal-wrap').forEach((m) => m.remove());
+  document.querySelectorAll('.menu, .modal-wrap:not(.decision)').forEach((m) => m.remove());
 }
 
 function openMenu(anchor, items) {
   closeMenus();
   const menu = document.createElement('div');
   menu.className = 'menu';
-  menu.innerHTML = items.map((it, i) => `<button data-i="${i}" ${it.disabled ? 'disabled' : ''}>${it.label}</button>`).join('');
+  menu.innerHTML = items
+    .map((it, i) => (it.sep ? '<hr>' : `<button data-i="${i}" ${it.disabled ? 'disabled' : ''}>${it.label}</button>`))
+    .join('');
   document.body.appendChild(menu);
   const r = anchor.getBoundingClientRect();
   const mw = menu.offsetWidth;
@@ -528,6 +597,109 @@ function openModal(html, onClick) {
   document.body.appendChild(wrap);
 }
 
+/** Modal de decisión que devuelve una promesa (no se cierra con clic afuera). */
+function decide(html, bind, fallback) {
+  return new Promise((resolve) => {
+    const wrap = document.createElement('div');
+    wrap.className = 'modal-wrap decision';
+    wrap.innerHTML = `<div class="modal" role="dialog">${html}</div>`;
+    document.body.appendChild(wrap);
+    const done = (v) => {
+      pendingDecisions.delete(onAbort);
+      wrap.remove();
+      resolve(v);
+    };
+    const onAbort = () => done(fallback);
+    pendingDecisions.add(onAbort);
+    bind(wrap, done);
+  });
+}
+
+function askBlocks(game, defender, attackers) {
+  const blockersFor = (a) => defender.battlefield.filter((b) => E.canBlock(game, b, a));
+  // Sin bloqueadores legales no hay decisión que tomar (CR 509.1a)
+  if (!attackers.some((a) => blockersFor(a).length)) return Promise.resolve(new Map());
+  const row = (a, i) => {
+    const opts = blockersFor(a);
+    const sel = (k) =>
+      `<select data-a="${i}" data-k="${k}"><option value="">— sin bloquear —</option>${opts
+        .map((b) => `<option value="${b.iid}">${esc(b.name)} ${E.power(game, b)}/${E.toughness(game, b)}</option>`)
+        .join('')}</select>`;
+    return `<div class="atk">${cardHTML(a, { small: true })}
+      <div><b>${esc(a.name)}</b> ${E.power(game, a)}/${E.toughness(game, a)} <small>${esc((a.keywords || []).join(', '))}</small><br>
+      ${opts.length ? sel(0) + (E.has(a, 'menace') ? ' + ' + sel(1) + ' <small>(menace: 2+ bloqueadores)</small>' : '') : '<small>No puedes bloquearla</small>'}</div></div>`;
+  };
+  return decide(
+    `<h3>🛡 Declara bloqueadores (CR 509)</h3>
+     <p class="hint">${esc(defender.name)}: te atacan ${attackers.length} criatura${attackers.length > 1 ? 's' : ''}. Vida: ${defender.life}.</p>
+     <div class="atk-list">${attackers.map(row).join('')}</div>
+     <div class="row-btns"><button class="btn ghost small" data-suggest>🤖 Sugerencia</button><button class="btn primary" data-ok>Confirmar bloqueos</button></div>`,
+    (wrap, done) => {
+      wrap.querySelector('[data-suggest]').onclick = () => {
+        const s = E.aiChooseBlocks(game, defender, attackers);
+        attackers.forEach((a, i) => {
+          (s.get(a) || []).forEach((b, k) => {
+            const el = wrap.querySelector(`select[data-a="${i}"][data-k="${k}"]`);
+            if (el) el.value = b.iid;
+          });
+        });
+      };
+      wrap.querySelector('[data-ok]').onclick = () => {
+        const map = new Map();
+        attackers.forEach((a, i) => {
+          const list = [...wrap.querySelectorAll(`select[data-a="${i}"]`)]
+            .map((el) => defender.battlefield.find((b) => b.iid === +el.value))
+            .filter(Boolean);
+          if (list.length) map.set(a, [...new Set(list)]);
+        });
+        done(map);
+      };
+    },
+    new Map()
+  );
+}
+
+function askResponse(game, player, ctx, options) {
+  const what =
+    ctx.type === 'spell'
+      ? `${esc(ctx.item.controller.name)} lanza <b>${esc(ctx.item.card.name)}</b>.`
+      : `Te atacan: ${ctx.attackers.map((a) => esc(a.name)).join(', ')}.`;
+  return decide(
+    `<h3>⏱ Tienes prioridad (CR 117)</h3>
+     <p>${what} ¿Quieres responder?</p>
+     <div class="pile">${options
+       .map((c) => `<div class="pile-item">${cardHTML(c, { small: false })}<button class="btn small" data-pick="${c.iid}">Lanzar</button></div>`)
+       .join('')}</div>
+     <button class="btn primary" data-pass>Pasar prioridad</button>`,
+    (wrap, done) => {
+      wrap.querySelector('[data-pass]').onclick = () => done(null);
+      wrap.querySelectorAll('[data-pick]').forEach((b) => (b.onclick = () => done(options.find((c) => c.iid === +b.dataset.pick))));
+    },
+    null
+  );
+}
+
+function askDiscard(game, p, n) {
+  return decide(
+    `<h3>🗑 Limpieza: descarta ${n} carta${n > 1 ? 's' : ''} (CR 514.1)</h3>
+     <div class="pile">${p.hand
+       .map((c) => `<label class="pile-item pick-card"><input type="checkbox" value="${c.iid}">${cardHTML(c)}</label>`)
+       .join('')}</div>
+     <button class="btn primary" data-ok disabled>Descartar</button>`,
+    (wrap, done) => {
+      const ok = wrap.querySelector('[data-ok]');
+      wrap.addEventListener('change', () => {
+        ok.disabled = wrap.querySelectorAll('input:checked').length !== n;
+      });
+      ok.onclick = () => {
+        const ids = [...wrap.querySelectorAll('input:checked')].map((i) => +i.value);
+        done(p.hand.filter((c) => ids.includes(c.iid)));
+      };
+    },
+    p.hand.slice(0, n)
+  );
+}
+
 function previewCard(c) {
   openModal(`
     <div class="preview">
@@ -546,33 +718,59 @@ function cardMenu(el) {
   const loc = E.findCard(g, +el.dataset.iid);
   if (!loc) return;
   const { card, zone, player } = loc;
-  const mine = player.idx === g.active && !player.isAI && !state.looping;
   const view = { label: '🔍 Ver carta', run: () => previewCard(card) };
-  if (!mine || g.winner != null) return previewCard(card);
-  const mv = (to, pos) => () => E.moveCard(g, card, to, pos);
+  if (player.isAI || player.idx !== g.active || !isHumanTurn()) return previewCard(card);
+
+  const manual = (fn) => () => humanAction(async () => {
+    fn();
+    E.runSBA(g);
+    await E.flushTriggers(g, io);
+  });
+  const mv = (to, pos) => manual(() => E.moveCard(g, card, to, { position: pos }));
+  const cast = () =>
+    humanAction(async () => {
+      let x = 0;
+      if (/\{X\}/.test(card.manaCost || '')) x = Math.max(0, parseInt(prompt('Valor de X:', '1') || '0', 10) || 0);
+      const res = await E.castSpell(g, player, card, io, { x });
+      if (!res.ok) toast(res.reason);
+      else if (res.effects?.length) g.banner = { label: 'RESOLVE', detail: `${card.name} · ${res.effects.join(', ')}`, key: Math.random() };
+    });
+
   let items = [];
   if (zone === 'hand') {
-    items = isLand(card)
-      ? [{ label: `🌲 Jugar tierra${player.landsPlayed ? ' (extra)' : ''}`, run: () => E.playLand(g, player, card) }]
-      : [
-          {
-            label: `✨ Lanzar (${card.cmc || 0})${E.availableMana(player) < (card.cmc || 0) ? ' ⚠ sin maná' : ''}`,
-            run: () => showEffects(card, E.castCard(g, player, card)),
-          },
-          { label: '⬇ Al campo sin pagar', run: () => E.castCard(g, player, card, { pay: false }) },
-        ];
-    items.push({ label: '🪦 Descartar', run: mv('graveyard') }, { label: '📚 Al fondo de la biblioteca', run: mv('library', 'bottom') });
+    if (isLand(card)) {
+      const why = E.landBlockReason(g, player, card);
+      items.push({
+        label: `🌲 Jugar tierra${why ? ' ⚠' : ''}`,
+        run: () => {
+          const res = E.playLand(g, player, card);
+          if (!res.ok) toast(res.reason);
+        },
+      });
+    } else {
+      const why = E.castBlockReason(g, player, card);
+      const payable = E.canPay(g, player, card);
+      items.push({ label: `✨ Lanzar ${esc(card.manaCost || '')}${why ? ' ⚠ timing' : !payable ? ' ⚠ maná' : ''}`, run: cast });
+    }
+    items.push({ sep: true }, { label: '🪦 Descartar (manual)', run: mv('graveyard') }, { label: '⬇ Al campo sin pagar (manual)', run: manual(() => { E.moveCard(g, card, 'battlefield'); }) });
   } else if (zone === 'battlefield') {
-    items = [
-      { label: card.tapped ? '↺ Enderezar' : '↻ Girar', run: () => (card.tapped = !card.tapped) },
-      { label: '🔥 Sacrificar / Destruir', run: mv('graveyard') },
+    for (const ab of E.activatedAbilities(g, player, card)) {
+      items.push({ label: `⚙ ${esc(ab.label)}`, run: () => humanAction(async () => {
+        const fx = await E.activate(g, player, card, ab, io);
+        g.banner = { label: 'ABILITY', detail: `${card.name}${fx.length ? ' · ' + fx.join(', ') : ''}`, key: Math.random() };
+      }) });
+    }
+    items.push(
+      { label: card.tapped ? '↺ Enderezar (manual)' : '↻ Girar (manual)', run: () => (card.tapped = !card.tapped) },
+      { sep: true },
+      { label: '🔥 Sacrificar', run: mv('graveyard') },
       { label: '🌀 Exiliar', run: mv('exile') },
-      { label: '✋ A la mano', run: mv('hand') },
-    ];
-    if (isCreature(card)) items.splice(1, 0, { label: '➕ +1/+1 (contador)', run: () => buff(card) });
+      { label: '✋ A la mano', run: mv('hand') }
+    );
+    if (isCreature(card)) items.push({ label: '➕ Contador +1/+1', run: () => card.counters.p1++ });
   } else if (zone === 'command') {
-    const cost = E.commanderCost(player, card);
-    items = [{ label: `👑 Lanzar comandante (${cost})${E.availableMana(player) < cost ? ' ⚠' : ''}`, run: () => E.castCard(g, player, card) }];
+    const why = E.castBlockReason(g, player, card);
+    items.push({ label: `👑 Lanzar comandante (${E.commanderCost(player, card)})${why ? ' ⚠ timing' : !E.canPay(g, player, card) ? ' ⚠ maná' : ''}`, run: cast });
   } else if (zone === 'graveyard') {
     return openPile(player.idx, 'graveyard');
   }
@@ -580,24 +778,15 @@ function cardMenu(el) {
   openMenu(el, items);
 }
 
-function buff(card) {
-  card.power = String((parseInt(card.power, 10) || 0) + 1);
-  card.toughness = String((parseInt(card.toughness, 10) || 0) + 1);
-}
-
-function showEffects(card, effects) {
-  state.game.banner = { label: 'CAST', detail: `${card.name}${effects.length ? ' · ' + effects.join(', ') : ''}`, key: Math.random() };
-}
-
 function openPile(pIdx, zone) {
   const g = state.game;
   const p = g.players[pIdx];
-  const mine = p.idx === g.active && !p.isAI;
+  const mine = p.idx === g.active && !p.isAI && isHumanTurn();
   const cards = [...p[zone]].reverse();
   openModal(
     `<h3>${zone === 'graveyard' ? '🪦 Cementerio' : '🌀 Exilio'} de ${esc(p.name)} (${cards.length})</h3>
      <div class="pile">${cards.map((c) => `<div class="pile-item">${cardHTML(c, { owner: p.idx, zone })}${
-       mine ? `<div class="pile-acts"><button data-to="hand" data-iid="${c.iid}">✋</button><button data-to="battlefield" data-iid="${c.iid}">⬆</button></div>` : ''
+       mine ? `<div class="pile-acts"><button data-to="hand" data-iid="${c.iid}" title="A la mano">✋</button><button data-to="battlefield" data-iid="${c.iid}" title="Al campo">⬆</button></div>` : ''
      }</div>`).join('') || '<p class="hint">Vacío</p>'}</div>`,
     (e) => {
       const b = e.target.closest('button[data-to]');
@@ -620,31 +809,31 @@ function openPile(pIdx, zone) {
 function openCombat() {
   const g = state.game;
   const p = g.players[g.active];
-  const attackers = p.battlefield.filter(E.canAttack);
-  const targets = g.players.filter((o) => o !== p && o.alive);
-  if (!attackers.length) return toast('No tienes criaturas que puedan atacar.');
+  const attackers = p.battlefield.filter((c) => E.canAttack(g, c));
+  const targets = E.opponents(g, p);
+  if (!attackers.length) return toast('No tienes criaturas que puedan atacar (mareo de invocación, CR 302.6).');
+  const def = [...targets].sort((a, b) => a.life - b.life)[0];
+  const tgtSelect = (iid) =>
+    `<select data-t="${iid}">${targets.map((o) => `<option value="${o.idx}" ${o === def ? 'selected' : ''}>${esc(o.name)} (${o.life}❤)</option>`).join('')}</select>`;
   openModal(
-    `<h3>⚔ Declarar ataque</h3>
-     <label>Objetivo:
-       <select id="atk-target">${targets.map((o) => `<option value="${o.idx}">${esc(o.name)} (${o.life}❤)</option>`).join('')}</select>
-     </label>
+    `<h3>⚔ Declarar atacantes (CR 508)</h3>
+     <p class="hint">Cada criatura puede atacar a un jugador distinto (CR 506.2). Los oponentes deciden sus bloqueos.</p>
      <div class="atk-list">${attackers
        .map(
-         (c) => `<label class="atk"><input type="checkbox" value="${c.iid}" checked>${cardHTML(c, { small: true })}<span>${esc(c.name)} ${esc(c.power)}/${esc(c.toughness)}</span></label>`
+         (c) => `<label class="atk"><input type="checkbox" value="${c.iid}" checked>${cardHTML(c, { small: true })}
+          <span>${esc(c.name)} ${E.power(g, c)}/${E.toughness(g, c)}<br><small>${esc((c.keywords || []).join(', '))}</small></span>${tgtSelect(c.iid)}</label>`
        )
        .join('')}</div>
-     <p class="hint">Los oponentes bloquean automáticamente según su mejor jugada.</p>
      <button class="btn primary" data-go>Atacar</button>`,
     (e, wrap) => {
       if (!e.target.closest('[data-go]')) return;
-      const target = g.players[+$('#atk-target', wrap).value];
-      const ids = [...wrap.querySelectorAll('.atk input:checked')].map((i) => +i.value);
-      const chosen = attackers.filter((c) => ids.includes(c.iid));
+      const plan = [...wrap.querySelectorAll('.atk input:checked')].map((i) => ({
+        attacker: attackers.find((c) => c.iid === +i.value),
+        defender: g.players[+wrap.querySelector(`select[data-t="${i.value}"]`).value],
+      }));
       closeMenus();
-      if (!chosen.length) return;
-      const summary = E.resolveCombat(g, p, chosen, target, { autoBlock: true });
-      g.banner = { label: 'COMBAT', detail: summary, key: Math.random() };
-      renderTable();
+      if (!plan.length) return;
+      humanAction(() => E.runCombat(g, p, plan, io));
     }
   );
 }
@@ -660,7 +849,7 @@ function toast(msg) {
   t.textContent = msg;
   t.classList.add('show');
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => t.classList.remove('show'), 2200);
+  toastTimer = setTimeout(() => t.classList.remove('show'), 3200);
 }
 
 // ---------- Eventos ----------
@@ -717,11 +906,10 @@ function bindTable() {
     if (!g) return;
     const t = e.target;
     const act = t.closest('[data-act]')?.dataset.act;
-    const p = g.players[g.active];
     if (act) {
       if (act === 'back') {
+        abortGame();
         state.game = null;
-        state.paused = false;
         $('#table').hidden = true;
         $('#setup').hidden = false;
         document.body.classList.remove('playing');
@@ -729,22 +917,23 @@ function bindTable() {
       }
       if (act === 'rematch') return startGame(state.simulate);
       if (act === 'pause') state.paused = !state.paused;
-      if (act === 'draw') E.draw(g, p, 1);
-      if (act === 'shuffle') {
-        p.library.sort(() => Math.random() - 0.5);
-        toast('Biblioteca barajada');
+      if (act === 'toggle-resp') {
+        state.settings.askResponses = !state.settings.askResponses;
+        save();
       }
+      if (!isHumanTurn()) return renderTable();
+      const p = g.players[g.active];
       if (act === 'mulligan') E.mulligan(g, p);
       if (act === 'combat') return openCombat();
-      if (act === 'end-turn') return endHumanTurn();
-      if (act === 'ai-me') return aiPlayForMe();
+      if (act === 'end-turn') return humanAction(() => E.endTurn(g, io));
+      if (act === 'ai-me') return humanAction(() => E.aiTurn(g, io, { skipStart: true }));
       return renderTable();
     }
     const life = t.closest('[data-life]');
     if (life) {
       const pl = g.players[+life.dataset.p];
       pl.life += +life.dataset.life * (e.shiftKey ? 5 : 1);
-      E.checkState(g);
+      E.runSBA(g);
       return renderTable();
     }
     const pile = t.closest('[data-pile]');
@@ -755,7 +944,7 @@ function bindTable() {
   root.addEventListener('dblclick', (e) => {
     const g = state.game;
     const el = e.target.closest('.card[data-zone="battlefield"]');
-    if (!g || !el) return;
+    if (!g || !el || !isHumanTurn()) return;
     const loc = E.findCard(g, +el.dataset.iid);
     if (loc && loc.player.idx === g.active && !loc.player.isAI) {
       closeMenus();

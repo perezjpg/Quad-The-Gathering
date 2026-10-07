@@ -339,3 +339,38 @@ body.playing .hero, body.playing .foot { display: none; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; }
 }
+
+/* ---------- Reglas: pasos, pila, maná ---------- */
+.steps {
+  list-style: none; display: flex; gap: 4px; padding: 0; margin: 0; max-width: 100%;
+  overflow-x: auto; scrollbar-width: none;
+}
+.steps li {
+  flex: none; font-size: 10px; letter-spacing: 0.04em; text-transform: uppercase; padding: 3px 8px;
+  border-radius: 999px; border: 1px solid var(--line); color: var(--muted); white-space: nowrap;
+}
+.steps li.done { opacity: 0.5; }
+.steps li.on { border-color: var(--ok); color: #04120f; background: var(--ok); font-weight: 700; }
+.stack-zone { font-size: 12px; border: 1px dashed var(--kuromi); border-radius: 999px; padding: 3px 12px; color: #d8c2ff; }
+.mana-badge { font-size: 12px; color: var(--muted); display: inline-flex; gap: 4px; align-items: center; }
+.mana-colors { letter-spacing: 1px; }
+.pool { color: var(--gold); }
+.poison { font-size: 12px; color: #9be26b; }
+.card .pt.buffed { border-color: var(--ok); color: var(--ok); }
+.menu hr { border: 0; border-top: 1px solid var(--line); margin: 4px 0; }
+.atk select { margin-left: auto; }
+.atk > div:not(.card) { flex: 1; min-width: 0; }
+.pick-card { cursor: pointer; }
+.pick-card input { margin: 0; }
+
+/* Cartas giradas: reservar el ancho extra de la rotación para no pisar a sus vecinas */
+.row .card.tapped { margin-inline: calc(var(--card-w) * 0.18); }
+.row .card.sm.tapped { margin-inline: calc(var(--card-sm) * 0.18); }
+/* En modales las cartas se muestran pequeñas y derechas */
+.modal .atk .card, .modal .pile .card { width: var(--card-sm); }
+.modal .pile .card { width: var(--card-w); }
+.modal .card.tapped { transform: none; }
+@media (max-width: 600px) {
+  .table-head .btn.small { padding: 6px 9px; font-size: 12px; }
+  .table-head h1 { font-size: 15px; }
+}
