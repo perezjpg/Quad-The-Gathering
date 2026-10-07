@@ -1,21 +1,35 @@
 # 🎴 Quad The Gathering
 
-Mesa virtual de **Commander** (Magic: The Gathering) para **2–4 jugadores**.
-Pega links de decks (Archidekt, Moxfield, …), revisa el análisis del pod y juega o mira una **simulación automática** en una mesa con zona de mando, vida 40, combate y banners de acción.
+Mesa virtual de **Commander** (Magic: The Gathering) para **2–4 jugadores**, en **LAN con tus amigos** o contra la **IA**.
+Pega links de decks (Archidekt, Moxfield, …), revisa el análisis del pod y juega con las **Reglas Completas aplicadas automáticamente**: fases, prioridad, pila, combate y avisos de efectos.
 
-*A Commander virtual tabletop for 2–4 players: import decks by link, check pod balance, then play or watch an AI-simulated game.*
+*A Commander virtual tabletop for 2–4 players over LAN or vs AI: import decks by link, check pod balance, and play with the Comprehensive Rules enforced automatically.*
 
 ## Inicio rápido / Quick start
 
 ```bash
 npm start          # http://localhost:3000  (Node 18+, sin dependencias)
-npm test           # parser, importadores y 30+ tests de reglas (CR)
+npm test           # parser, importadores y ~45 tests de reglas (CR)
 ```
 
+### 🎴 Partida local (tú + IA)
 1. Elige 2, 3 o 4 jugadores.
 2. Pega un link en cada asiento (o cambia a **Texto** y pega la lista). También puedes pulsar **🎴 Decks demo**.
-3. **▶ Jugar en la mesa**: tú juegas tu asiento y la IA juega los asientos marcados como IA.
+3. **▶ Jugar en la mesa**: tú controlas tu asiento y la IA juega los asientos marcados como IA.
    **🤖 Simular partida**: todos los asientos los juega la IA y tú solo miras.
+
+### 🌐 Multijugador LAN
+1. **Anfitrión:** ejecuta `npm start`. La consola muestra tus direcciones LAN (por ejemplo, `http://192.168.1.20:3000`).
+2. Abre la app, escribe tu nombre y pulsa **Crear sala**. Recibes un código de 4 letras.
+3. **Amigos:** abren la dirección del anfitrión (o el link `…/?room=CODE` del lobby), escriben su nombre y pulsan **Unirse**.
+4. Cada quien carga su deck (link, texto o demo). El anfitrión puede poner IA en los asientos vacíos y pulsa **▶ Empezar partida**.
+
+> Fuera de la misma red Wi-Fi, usen una VPN de juego como **Radmin VPN, Hamachi, ZeroTier o Tailscale** y compartan la IP que les da esa app.
+> El servidor escucha en `0.0.0.0:3000`. Si Windows pregunta por el firewall, permite el acceso en redes privadas.
+> La partida corre en el servidor del anfitrión. Cada jugador solo ve su propia mano.
+
+### 🖼 Imágenes de cartas
+No hace falta buscar ninguna base de datos. La app usa **[Scryfall](https://scryfall.com/docs/api)**, la base de datos pública de Magic. El servidor guarda una caché en `data/card-cache.json`: el anfitrión descarga cada carta una sola vez y la comparte con toda la LAN. Las imágenes se cargan desde el CDN de Scryfall.
 
 ## Sitios soportados / Supported sites
 
@@ -37,36 +51,48 @@ npm test           # parser, importadores y 30+ tests de reglas (CR)
 - Arte del comandante, número de cartas, MV promedio, tierras y precio (USD, Scryfall)
 - Curva de maná, identidad de color, ramp / robo / removal / wipes / tutores
 - **Bracket estimado** (1–5) a partir de Game Changers, tutores, turnos extra y destrucción masiva de tierras
+- Validación del deck: 100 cartas, singleton e identidad de color (CR 903.5)
 - Aviso de **pod desbalanceado** cuando los brackets difieren en 2 o más
 - Selector de comandante cuando el sitio no lo marca
 - **🔗 Compartir pod**: copia un link con nombres y URLs de los decks
 
 **Mesa (sigue las Reglas Completas: ver [docs/REGLAS.md](docs/REGLAS.md))**
-- **Barra de pasos del turno** (CR 500): Untap → Upkeep → Draw → Main 1 → Combat → Main 2 → End → Cleanup
-- **Maná con colores** (CR 106/107.4): costes híbridos, pirexianos y {X}; reserva de maná que se vacía entre pasos; Command Tower y Signets
-- **La pila y la prioridad** (CR 405/117): cuando alguien lanza un hechizo puedes responder con instantáneos (por ejemplo, Counterspell), y la IA también contrarresta
-- **Tiempos**: una tierra por turno (305.2) y velocidad de conjuro (307.1). Si una jugada es ilegal, la app te dice qué regla la impide
-- **Combate en pasos** (CR 506–511): eliges a quién ataca cada criatura y declaras tus bloqueadores cuando te atacan. Hay first/double strike, menace, trample, deathtouch, lifelink, flying/reach, infect y más
-- **Acciones basadas en estado** (CR 704): leyenda, resistencia 0, veneno, 21 de daño de comandante, biblioteca vacía
-- **Commander** (CR 903): impuesto, vuelta a la zona de mando, 40 de vida y validación del deck (100 cartas, singleton, identidad de color)
-- **Disparadores**: "dies" (Blood Artist, Zulaport), ataque, mantenimiento y paso final; reemplazo de tokens (Chatterfang); "lords"
-- **🤖 IA juega por mí**, velocidad de simulación con pausa, banners como en el video y registro con números de regla
+- **Fases completas con prioridad** (CR 117/500): el motor da prioridad en cada paso, con paradas inteligentes o completas. La pila se ve en la mesa y puedes responder a lo que lancen los demás
+- **Avisos automáticos**: una franja muestra los efectos rivales que te afectan (Thalia, Rhystic Study, Esper Sentinel, Smothering Tithe, Rule of Law…). Al tocar una carta ves su coste real con el desglose (CR 601.2f)
+- **Mano inicial**: mulligan de Londres (tú decides y eliges qué va al fondo)
+- **Objetivos** (601.2c): eliges el objetivo de tus hechizos. Si desaparece antes de resolverse, el hechizo no se resuelve (608.2b)
+- **Maná con colores** (CR 106/107.4): híbrido, pirexiano, {X}, Treasure, Command Tower, Signets
+- **Combate en pasos** (506–511): eliges a quién ataca cada criatura y declaras tus bloqueadores. Hay first/double strike, menace, trample, deathtouch, lifelink, flying/reach, infect y más
+- **Acciones basadas en estado** (704) y **reglas de Commander** (903): impuesto, zona de mando, 21 de daño de comandante
+- **🤖 IA juega por mí**, **⏭ Pasar turno**, velocidad y pausa (anfitrión), registro con números de regla
+
+## La IA / How the AI plays
+
+En cada turno la IA:
+1. Juega una tierra (prefiere las que entran enderezadas) y activa fetchlands o habilidades "{T}: Create…".
+2. Lanza hechizos que puede pagar con los colores correctos. Prioriza ramp, después su comandante y luego lo más caro.
+3. Guarda los contrahechizos y el removal instantáneo para responder: contrarresta amenazas grandes y elimina atacantes peligrosos.
+4. Ataca al oponente con menos vida sin regalar criaturas, y bloquea cuando le conviene o cuando un golpe sería letal.
 
 ## Estructura / Layout
 
 ```
-server.js              servidor HTTP + proxy /api/deck
-src/sources.js         detección de sitio, descarga y normalización
-public/index.html      app (sin build)
-public/app.js          UI: setup, mesa, menús, modales
-public/lib/deckText.js parser de listas en texto (compartido servidor/cliente)
-public/lib/scryfall.js datos de cartas vía Scryfall /cards/collection
-public/lib/stats.js    análisis y bracket
-public/lib/engine.js   motor de reglas: turnos, pila, combate, SBA, disparadores, IA
-public/lib/mana.js     costes y pago de maná con colores
-docs/REGLAS.md         cobertura de las Reglas Completas
-public/lib/demo.js     4 decks demo
-test/                  node:test
+server.js               servidor HTTP: estáticos, /api/deck, /api/cards, /api/rooms
+src/sources.js          detección de sitio, descarga y normalización de decks
+src/cards.js            caché de cartas de Scryfall en el servidor (data/card-cache.json)
+src/rooms.js            salas LAN (Server-Sent Events + POST)
+public/index.html       app (sin build)
+public/app.js           UI: setup, lobby LAN, mesa, menús y decisiones
+public/lib/engine.js    motor de reglas: turnos, prioridad, pila, combate, SBA, disparadores, IA
+public/lib/mana.js      costes y pago de maná con colores
+public/lib/session.js   ejecuta una partida y genera la vista de cada jugador (navegador o servidor)
+public/lib/deckText.js  parser de listas en texto
+public/lib/deckBuild.js construir decks y elegir comandante
+public/lib/scryfall.js  datos de cartas vía Scryfall /cards/collection
+public/lib/stats.js     análisis, bracket y legalidad
+public/lib/demo.js      4 decks demo
+docs/REGLAS.md          cobertura de las Reglas Completas
+test/                   node:test
 ```
 
 Datos de cartas por [Scryfall](https://scryfall.com). Proyecto de fans, no afiliado a Wizards of the Coast.

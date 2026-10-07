@@ -374,3 +374,43 @@ body.playing .hero, body.playing .foot { display: none; }
   .table-head .btn.small { padding: 6px 9px; font-size: 12px; }
   .table-head h1 { font-size: 15px; }
 }
+
+/* ---------- LAN / lobby ---------- */
+.section-title { font-family: Cinzel, serif; font-size: 18px; margin: 24px 0 0; }
+.lan-panel {
+  margin-top: 12px; padding: 14px 16px; border-radius: var(--radius);
+  background: linear-gradient(120deg, rgba(57, 197, 187, 0.12), rgba(155, 93, 229, 0.12));
+  border: 1px solid var(--line);
+}
+.lan-panel h2 { margin: 0 0 4px; font-family: Cinzel, serif; font-size: 18px; }
+.lan-panel code, .hint code { background: var(--bg); padding: 1px 6px; border-radius: 6px; }
+.lan-row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+.lan-row input { background: var(--bg); border: 1px solid var(--line); border-radius: 999px; padding: 8px 14px; min-width: 0; flex: 1 1 140px; }
+.lan-row .code-input { flex: 0 1 110px; text-transform: uppercase; letter-spacing: 0.2em; text-align: center; }
+#lobby { padding-top: 16px; }
+.lobby-head { display: flex; justify-content: space-between; gap: 12px; align-items: flex-start; flex-wrap: wrap; }
+.lobby-head h2 { margin: 0; font-family: Cinzel, serif; }
+.room-code { font-family: ui-monospace, monospace; letter-spacing: 0.25em; color: var(--miku); background: var(--bg-2); border: 1px solid var(--miku); border-radius: 10px; padding: 2px 10px; }
+.links { display: flex; flex-wrap: wrap; gap: 6px; }
+.link-chip { background: var(--bg-2); border: 1px solid var(--line); border-radius: 999px; padding: 5px 10px; cursor: pointer; font-size: 12px; overflow-wrap: anywhere; text-align: left; }
+.kind { font-size: 11px; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--line); margin-left: auto; }
+.kind-ai { color: var(--kuromi); border-color: var(--kuromi); }
+.kind-human { color: var(--miku); border-color: var(--miku); }
+.seat .dot.off { background: #555; box-shadow: none; }
+.seat select { background: var(--bg); border: 1px solid var(--line); border-radius: 10px; padding: 8px; width: 100%; }
+
+/* ---------- Mesa: avisos y prioridad ---------- */
+.effects { display: flex; flex-wrap: wrap; gap: 6px; }
+.effect { font-size: 12px; background: rgba(244, 162, 97, 0.12); border: 1px solid rgba(244, 162, 97, 0.5); color: #ffd7b5; border-radius: 999px; padding: 4px 10px; }
+.toolbar .prio { font-size: 13px; color: var(--ok); font-weight: 700; }
+.toolbar .prio-error { font-size: 12px; color: #ff8a93; flex-basis: 100%; text-align: center; }
+.btn.on { border-color: var(--ok); color: var(--ok); }
+.card.playable { box-shadow: 0 0 0 2px var(--ok), 0 0 14px rgba(110, 231, 168, 0.55); }
+.card.attacking { box-shadow: 0 0 0 2px var(--danger), 0 0 12px rgba(230, 57, 70, 0.6); }
+.card.blocking { box-shadow: 0 0 0 2px #6aa9ff, 0 0 12px rgba(106, 169, 255, 0.6); }
+.card .pt.loyal { border-color: var(--gold); color: var(--gold); }
+.menu-note { margin: 2px 10px 6px; font-size: 12px; color: #ffcf9e; max-width: 260px; }
+.target-list { display: flex; flex-direction: column; gap: 6px; }
+.target-btn { display: flex; align-items: center; gap: 10px; background: var(--bg); border: 1px solid var(--line); border-radius: 10px; padding: 6px 10px; cursor: pointer; text-align: left; }
+.target-btn:hover { border-color: var(--ok); }
+.modal .row-btns { flex-wrap: wrap; }

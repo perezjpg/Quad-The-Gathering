@@ -60,13 +60,25 @@ export function placeholder(name) {
   };
 }
 
+/** Carga entradas previamente guardadas (caché en disco del servidor). */
+export function primeCache(obj) {
+  for (const [k, v] of Object.entries(obj || {})) if (v && !v.missing) cache.set(k, v);
+}
+
+/** Exporta la caché (solo cartas encontradas) para guardarla en disco. */
+export function exportCache() {
+  const out = {};
+  for (const [k, v] of cache) if (!v.missing) out[k] = v;
+  return out;
+}
+
 /**
  * Busca la información de una lista de nombres.
  * @param {string[]} names
  * @param {(done:number,total:number)=>void} [onProgress]
  * @returns {Promise<Map<string, object>>} mapa nombre-en-minúsculas -> resumen
  */
-export async function fetchCards(names, onProgress) {
+export async function fetchCards(names, onProgress, { headers = {} } = {}) {
   const unique = [...new Set(names.map(key))];
   const pending = unique.filter((n) => !cache.has(n));
   const original = new Map(names.map((n) => [key(n), frontName(n)]));
@@ -75,7 +87,7 @@ export async function fetchCards(names, onProgress) {
     const chunk = pending.slice(i, i + 75);
     const res = await fetch(API, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json', ...headers },
       body: JSON.stringify({ identifiers: chunk.map((n) => ({ name: original.get(n) })) }),
     });
     if (!res.ok) throw new Error(`Scryfall respondió ${res.status}`);
@@ -95,6 +107,13 @@ export async function fetchCards(names, onProgress) {
 
   const out = new Map();
   for (const n of unique) out.set(n, cache.get(n) || placeholder(original.get(n)));
+  return out;
+}
+
+/** Mapa solo con lo que ya está en caché (para modo sin conexión). */
+export function cachedLookup(names) {
+  const out = new Map();
+  for (const n of names) out.set(key(n), cache.get(key(n)) || placeholder(frontName(n)));
   return out;
 }
 

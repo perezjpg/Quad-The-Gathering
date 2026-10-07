@@ -40,7 +40,7 @@ export const costTotal = (cost, x = 0) => cost.generic + cost.pips.length + cost
 export function manaOptions(card, commanderCI = COLORS) {
   const text = card.oracle || '';
   const opts = [];
-  for (const m of text.matchAll(/\{T\}(?:, (?:Pay \d+ life|Remove [^:]*))?: Add ([^.\n]+)/gi)) {
+  for (const m of text.matchAll(/\{T\}(?:, (?:Pay \d+ life|Remove [^:]*|Sacrifice [^:]*))?: Add ([^.\n]+)/gi)) {
     const body = m[1];
     if (/one mana of any color in your commander/i.test(body)) opts.push(...commanderCI.map((c) => [c]));
     else if (/two mana in any combination of colors/i.test(body)) opts.push(['*', '*']);
@@ -73,7 +73,11 @@ export function manaOptions(card, commanderCI = COLORS) {
 export function manaSources(p, commanderCI) {
   return p.battlefield
     .filter((c) => !c.tapped && !(isCreature(c) && c.sick && !hasKw(c, 'haste')))
-    .map((c) => ({ card: c, options: manaOptions(c, commanderCI) }))
+    .map((c) => ({
+      card: c,
+      options: manaOptions(c, commanderCI),
+      sacrifice: /\{T\}, Sacrifice [^:]*: Add/i.test(c.oracle || ''), // Treasure (se sacrifica al pagar)
+    }))
     .filter((s) => s.options.length);
 }
 

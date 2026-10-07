@@ -1,15 +1,14 @@
 // Motor de Commander basado en las Reglas Completas de Magic (Comprehensive Rules).
-// Los números "CR x.y" en los comentarios y en el registro apuntan a la regla correspondiente.
-// Ver docs/REGLAS.md para la lista de lo implementado y lo aproximado.
+// Los números "CR x.y" en comentarios y en el registro apuntan a la regla correspondiente.
+// Ver docs/REGLAS.md para la cobertura completa.
 //
-// La interfaz `io` la provee la UI:
-//   io.step(label, detail)                 -> Promise  (animación / pausa)
-//   io.chooseBlocks(game, defender, atks)  -> Promise<Map<atk, blocker[]>>   (solo humanos)
-//   io.respond(game, player, ctx, options) -> Promise<card|null>             (solo humanos)
-//   io.chooseDiscard(game, player, n)      -> Promise<card[]>                (solo humanos)
+// El motor conduce la partida completa (fases, pasos, prioridad). Cuando necesita una decisión
+// de un jugador humano llama a `io.decide(player, request)` y espera la respuesta; para la IA decide solo.
+//   io.step(label, detail) -> Promise          animación / ritmo
+//   io.decide(player, req) -> Promise<value>   decisiones humanas (req es serializable)
 
 import { isLand, isCreature } from './stats.js';
-import { parseCost, costTotal, manaSources, planPayment, COLORS } from './mana.js';
+import { parseCost, manaSources, planPayment, COLORS } from './mana.js';
 
 export const STARTING_LIFE = 40; // CR 903.7
 export const COMMANDER_DAMAGE_LETHAL = 21; // CR 704.6c / 903.10a
@@ -30,19 +29,23 @@ export const STEPS = [
   { id: 'end', label: 'End', cr: '513' },
   { id: 'cleanup', label: 'Cleanup', cr: '514' },
 ];
+const MAIN_STEPS = ['main1', 'main2'];
 
 let iidSeq = 0;
+let stackSeq = 0;
 
 const NUM = { a: 1, an: 1, one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, x: 0 };
 const num = (s, x = 0) => (String(s).toLowerCase() === 'x' ? x : (NUM[String(s).toLowerCase()] ?? (parseInt(s, 10) || 1)));
 const escRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const cap = (s) => s.replace(/\b\w/g, (c) => c.toUpperCase());
 
 export const has = (c, kw) => (c.keywords || []).some((k) => k.toLowerCase() === kw);
 export const isInstantOrSorcery = (c) => /\b(Instant|Sorcery)\b/.test(c.typeLine);
-export const isPermanentCard = (c) => !isInstantOrSorcery(c);
+const isInstantSpeed = (c) => /\bInstant\b/.test(c.typeLine) || has(c, 'flash');
 const isLegendary = (c) => /\bLegendary\b/.test(c.typeLine);
 const isPlaneswalker = (c) => /\bPlaneswalker\b/.test(c.typeLine);
 const subtypes = (c) => (c.typeLine.split('—')[1] || '').trim().split(/\s+/).filter(Boolean);
+const PASS = { type: 'pass' };
 
 function shuffle(arr) {
   for (let i = arr.length - 1; i > 0; i--) {
@@ -79,6 +82,7 @@ function makeToken(owner, p, t, subtype = '', keywords = []) {
       keywords,
       power: String(p),
       toughness: String(t),
+      colorIdentity: [],
       img: null,
       imgSmall: null,
     },
@@ -87,7 +91,31 @@ function makeToken(owner, p, t, subtype = '', keywords = []) {
   );
 }
 
-/** Fuerza/resistencia actuales: base + contadores (CR 122) + efectos estáticos de "lords" (CR 613.4c). */
+const ARTIFACT_TOKENS = {
+  treasure: '{T}, Sacrifice this token: Add one mana of any color.',
+  clue: '{2}, Sacrifice this token: Draw a card.',
+  food: '{2}, {T}, Sacrifice this token: You gain 3 life.',
+};
+
+function makeArtifactToken(owner, kind) {
+  return makeCard(
+    {
+      name: cap(kind),
+      typeLine: `Token Artifact — ${cap(kind)}`,
+      cmc: 0,
+      manaCost: '',
+      oracle: ARTIFACT_TOKENS[kind] || '',
+      keywords: [],
+      colorIdentity: [],
+      img: null,
+      imgSmall: null,
+    },
+    owner,
+    { isToken: true, sick: false }
+  );
+}
+
+/** Fuerza/resistencia actuales: base + contadores (CR 122) + "lords" (CR 613.4c) + efectos hasta fin de turno. */
 export function power(game, c) {
   return base(c.power) + c.counters.p1 - c.counters.m1 + lordBonus(game, c).p + (c.tempP || 0);
 }
@@ -102,8 +130,7 @@ function base(v) {
 function lordBonus(game, c) {
   const out = { p: 0, t: 0 };
   if (!game || !isCreature(c)) return out;
-  const ctrl = game.players[c.owner];
-  for (const src of ctrl?.battlefield || []) {
+  for (const src of game.players[c.owner]?.battlefield || []) {
     for (const m of (src.oracle || '').matchAll(/(other )?(?:([a-z]+) )?creatures you control get \+(\d+)\/\+(\d+)(?![^.]*until end of turn)/gi)) {
       if (m[1] && src === c) continue;
       if (m[2] && !subtypes(c).some((t) => t.toLowerCase() === m[2].toLowerCase())) continue;
@@ -119,7 +146,7 @@ function lordBonus(game, c) {
 /**
  * @param {{name:string, isAI:boolean, color:string, deckName?:string, entries:{info:object, qty:number, board:string}[]}[]} configs
  */
-export function createGame(configs) {
+export function createGame(configs, settings = {}) {
   const players = configs.map((cfg, idx) => {
     const library = [];
     const command = [];
@@ -145,12 +172,16 @@ export function createGame(configs) {
       command,
       commanderCI: COLORS.filter((c) => ci.has(c)),
       commanderTax: {}, // CR 903.8
-      commanderDamage: {}, // iid del comandante -> daño de combate recibido (CR 903.10a)
+      commanderDamage: {}, // iid del comandante -> daño de combate (CR 903.10a)
       landsPlayed: 0,
+      castsThisTurn: [],
       turnsTaken: 0,
       alive: true,
       drewFromEmpty: false,
       mulligans: 0,
+      autoPassTurn: -1,
+      aiTurn: -1,
+      lastError: null,
     };
   });
 
@@ -159,6 +190,7 @@ export function createGame(configs) {
     active: Math.floor(Math.random() * players.length), // CR 103.1
     firstPlayer: 0,
     turn: 1,
+    turnId: 0,
     step: 'untap',
     stack: [],
     pools: players.map(() => []),
@@ -167,13 +199,11 @@ export function createGame(configs) {
     winner: null,
     banner: null,
     pendingTriggers: [],
+    settings: { fullStops: false, ...settings },
+    aborted: false,
   };
   game.firstPlayer = game.active;
-
-  for (const p of players) {
-    draw(game, p, 7); // CR 103.4
-    if (p.isAI) aiMulligan(game, p);
-  }
+  for (const p of players) for (let i = 0; i < 7 && p.library.length; i++) p.hand.push(p.library.shift()); // CR 103.4
   log(game, `🎲 ${players[game.active].name} empieza la partida (CR 103.1).`);
   return game;
 }
@@ -185,44 +215,76 @@ export function log(game, msg) {
 
 export function setStep(game, step) {
   game.step = step;
-  for (let i = 0; i < game.pools.length; i++) game.pools[i] = []; // CR 106.4: la reserva se vacía
+  for (let i = 0; i < game.pools.length; i++) game.pools[i] = []; // CR 106.4
 }
+
+export const aiControlled = (game, p) => p.isAI || p.aiTurn === game.turnId;
 
 export function draw(game, p, n = 1) {
   for (let i = 0; i < n; i++) {
     const c = p.library.shift();
     if (!c) {
-      p.drewFromEmpty = true; // CR 704.5b (se revisa como acción basada en estado)
+      p.drewFromEmpty = true; // CR 704.5b
       break;
     }
     p.hand.push(c);
+    game.pendingTriggers.push({ type: 'draw', player: p.idx });
   }
   runSBA(game);
 }
 
-/** Mulligan de Londres (CR 103.5). En multijugador el primero es gratis (CR 103.5c). */
-export function mulligan(game, p) {
+// ---------- Mulligan (CR 103.5) ----------
+
+function mulliganOnce(game, p) {
   p.library.push(...p.hand);
   p.hand = [];
   shuffle(p.library);
   p.mulligans++;
-  for (let i = 0; i < 7; i++) p.hand.push(p.library.shift());
-  const free = game.players.length > 2 ? 1 : 0;
-  const toBottom = Math.max(0, p.mulligans - free);
-  if (toBottom) {
-    const sorted = [...p.hand].sort((a, b) => (b.cmc || 0) - (a.cmc || 0));
-    for (const c of sorted.slice(0, toBottom)) moveCard(game, c, 'library', { position: 'bottom' });
-  }
-  log(game, `🔄 ${p.name} hace mulligan #${p.mulligans}${toBottom ? `, pone ${toBottom} al fondo` : ' (gratis, CR 103.5c)'}.`);
+  for (let i = 0; i < 7 && p.library.length; i++) p.hand.push(p.library.shift());
+  log(game, `🔄 ${p.name} hace mulligan #${p.mulligans}.`);
 }
 
-function aiMulligan(game, p) {
-  for (let tries = 0; tries < 2; tries++) {
-    const lands = p.hand.filter(isLand).length;
-    if (lands >= 2 && lands <= 5) return;
-    mulligan(game, p);
+/** Cartas a poner al fondo al quedarse con la mano: el primer mulligan es gratis en multijugador (CR 103.5c). */
+export function mulliganBottomCount(game, p) {
+  return Math.max(0, p.mulligans - (game.players.length > 2 ? 1 : 0));
+}
+
+/** Fase previa: cada jugador decide sus mulligans en orden de turno (CR 103.5). */
+export async function pregame(game, io) {
+  const n = game.players.length;
+  for (let k = 0; k < n; k++) {
+    const p = game.players[(game.firstPlayer + k) % n];
+    if (p.isAI) {
+      for (let tries = 0; tries < 2; tries++) {
+        const lands = p.hand.filter(isLand).length;
+        if (lands >= 2 && lands <= 5) break;
+        mulliganOnce(game, p);
+      }
+    } else {
+      while (p.mulligans < 6) {
+        const v = await io.decide(p, { kind: 'mulligan', mulligans: p.mulligans, toBottom: mulliganBottomCount(game, p) });
+        if (v !== 'mulligan') break;
+        mulliganOnce(game, p);
+      }
+    }
+    const nBottom = mulliganBottomCount(game, p);
+    if (nBottom > 0) {
+      let chosen = [];
+      if (!p.isAI) {
+        const ids = await io.decide(p, { kind: 'bottom', n: nBottom });
+        chosen = (Array.isArray(ids) ? ids : []).map((id) => p.hand.find((c) => c.iid === id)).filter(Boolean).slice(0, nBottom);
+      }
+      if (chosen.length < nBottom) {
+        const rest = [...p.hand].filter((c) => !chosen.includes(c)).sort((a, b) => (b.cmc || 0) - (a.cmc || 0));
+        chosen.push(...rest.slice(0, nBottom - chosen.length));
+      }
+      for (const c of chosen) moveCard(game, c, 'library', { position: 'bottom' });
+      log(game, `   ${p.name} pone ${nBottom} carta${nBottom > 1 ? 's' : ''} al fondo (mulligan de Londres).`);
+    }
   }
 }
+
+// ---------- Zonas ----------
 
 export function findCard(game, iid) {
   for (const p of game.players) {
@@ -231,15 +293,14 @@ export function findCard(game, iid) {
       if (i >= 0) return { player: p, zone, index: i, card: p[zone][i] };
     }
   }
-  const s = game.stack.findIndex((it) => it.card.iid === iid);
+  const s = game.stack.findIndex((it) => it.card?.iid === iid);
   if (s >= 0) return { player: game.stack[s].controller, zone: 'stack', index: s, card: game.stack[s].card };
   return null;
 }
 
 /**
  * Mueve una carta. CR 400.7: al cambiar de zona es un objeto nuevo (se limpian estados).
- * CR 903.9b: si un comandante iría a la biblioteca, su dueño lo pone en la zona de mando.
- * (Cementerio/exilio -> zona de mando ocurre como acción basada en estado, CR 903.9a.)
+ * CR 903.9b: un comandante que iría a la biblioteca va a la zona de mando.
  */
 export function moveCard(game, card, toZone, { position = 'top' } = {}) {
   const loc = findCard(game, card.iid);
@@ -272,26 +333,80 @@ export function commanderCost(p, card) {
   return (card.cmc || 0) + (p.commanderTax[card.iid] || 0); // CR 903.8
 }
 
-// ---------- Maná ----------
+// ---------- Maná y costes ----------
 
 export function sourcesOf(p) {
   return manaSources(p, p.commanderCI.length ? p.commanderCI : []);
 }
 
-export function costOf(p, card) {
+const TYPE_WORDS = ['creature', 'artifact', 'enchantment', 'instant', 'sorcery', 'planeswalker', 'legendary'];
+
+function spellMatchesKind(card, kind) {
+  if (!kind) return true;
+  const k = kind.toLowerCase().trim();
+  const tl = card.typeLine.toLowerCase();
+  if (k.startsWith('non')) return !tl.includes(k.slice(3));
+  return k.split(/ and | or /).some((w) => tl.includes(w.trim()));
+}
+
+/**
+ * Efectos estáticos que modifican el coste (CR 601.2f): Thalia, Sphere of Resistance, Grand Arbiter,
+ * Goblin Electromancer… Los aumentos/reducciones solo afectan el maná genérico.
+ * @returns {{source:string, owner:string, amount:number}[]}
+ */
+export function costModifiers(game, p, card) {
+  const mods = [];
+  for (const pl of game.players) {
+    for (const src of pl.battlefield) {
+      const text = src.oracle || '';
+      const re = /((?:non)?(?:creature|artifact|enchantment|instant|sorcery|planeswalker|legendary)(?: and (?:instant|sorcery))? )?spells( your opponents cast| you cast| each opponent casts)? costs? \{(\d+)\} (more|less) to cast/gi;
+      for (const m of text.matchAll(re)) {
+        const who = (m[2] || '').trim();
+        if (who.includes('opponent') && pl === p) continue;
+        if (who === 'you cast' && pl !== p) continue;
+        if (!spellMatchesKind(card, m[1])) continue;
+        mods.push({ source: src.name, owner: pl.name, amount: m[4].toLowerCase() === 'more' ? +m[3] : -m[3] });
+      }
+      const first = text.match(/the first ((?:non)?(?:creature )?)?spell each opponent casts (?:each|during each of your) turns? costs \{(\d+)\} more/i);
+      if (first && pl !== p && spellMatchesKind(card, first[1]) && p.castsThisTurn.filter((t) => spellMatchesKind({ typeLine: t }, first[1])).length === 0)
+        mods.push({ source: src.name, owner: pl.name, amount: +first[2] });
+    }
+  }
+  return mods;
+}
+
+export function costOf(game, p, card) {
   const cost = parseCost(card.manaCost);
   if (p.command.includes(card)) cost.generic += p.commanderTax[card.iid] || 0;
+  const delta = costModifiers(game, p, card).reduce((n, m) => n + m.amount, 0);
+  cost.generic = Math.max(0, cost.generic + delta);
   return cost;
 }
 
-export function canPay(game, p, card, x = 0) {
-  return planPayment(sourcesOf(p), game.pools[p.idx], costOf(p, card), { x, life: p.life }).ok;
+export function costText(cost, x = 0) {
+  const parts = [];
+  if (cost.x) parts.push('{X}'.repeat(cost.x));
+  if (cost.generic || (!cost.pips.length && !cost.x)) parts.push(`{${cost.generic}}`);
+  for (const pip of cost.pips) parts.push(`{${pip.any.join('/')}${pip.phyrexian ? '/P' : ''}}`);
+  return parts.join('') + (x ? ` (X=${x})` : '');
 }
 
-function pay(game, p, cost, x) {
-  const plan = planPayment(sourcesOf(p), game.pools[p.idx], cost, { x, life: p.life });
+export function canPay(game, p, card, x = 0) {
+  return planPayment(sourcesOf(p), game.pools[p.idx], costOf(game, p, card), { x, life: p.life }).ok;
+}
+
+function canPayGeneric(game, p, n) {
+  return planPayment(sourcesOf(p), game.pools[p.idx], { generic: n, pips: [], x: 0 }, { life: p.life }).ok;
+}
+
+function payCost(game, p, cost, x = 0) {
+  const sources = sourcesOf(p);
+  const plan = planPayment(sources, game.pools[p.idx], cost, { x, life: p.life });
   if (!plan.ok) return false;
-  plan.used.forEach((s) => (s.tapped = true));
+  for (const c of plan.used) {
+    c.tapped = true;
+    if (sources.find((s) => s.card === c)?.sacrifice) moveCard(game, c, 'graveyard'); // Treasure
+  }
   game.pools[p.idx] = plan.pool;
   if (plan.lifePaid) p.life -= plan.lifePaid;
   return true;
@@ -301,30 +416,155 @@ export function availableMana(p) {
   return sourcesOf(p).reduce((n, s) => n + Math.max(...s.options.map((o) => o.length)), 0);
 }
 
-// ---------- Tiempos (timing) ----------
+// ---------- Restricciones y tiempos ----------
 
-const sorcerySpeedOK = (game, p) =>
-  game.active === p.idx && (game.step === 'main1' || game.step === 'main2') && game.stack.length === 0;
+const sorcerySpeedOK = (game, p) => game.active === p.idx && MAIN_STEPS.includes(game.step) && game.stack.length === 0;
 
-/** Razón por la que no se puede lanzar (o null). CR 117.1a, 307.1, 301.1, 601.3, 903.8 */
+function restrictions(game, p, card) {
+  for (const pl of game.players) {
+    for (const src of pl.battlefield) {
+      const t = (src.oracle || '').toLowerCase();
+      if (/each player can't cast more than one spell each turn/.test(t) && p.castsThisTurn.length >= 1)
+        return `${src.name}: solo un hechizo por turno.`;
+      if (pl !== p && /each opponent can't cast more than one spell each turn/.test(t) && p.castsThisTurn.length >= 1)
+        return `${src.name} (${pl.name}): solo un hechizo por turno.`;
+      if (pl !== p && /your opponents can't cast spells during your turn/.test(t) && game.active === pl.idx)
+        return `${src.name} (${pl.name}): no puedes lanzar hechizos en su turno.`;
+      if (pl !== p && /each opponent can't cast noncreature spells with mana value greater than the number of lands that player controls/.test(t) &&
+        !isCreature(card) && (card.cmc || 0) > p.battlefield.filter(isLand).length)
+        return `${src.name} (${pl.name}): valor de maná mayor que tus tierras.`;
+    }
+  }
+  return null;
+}
+
+/** Razón por la que no se puede lanzar (o null). CR 117.1a, 307.1, 601.3, 903.8, 101.2 */
 export function castBlockReason(game, p, card) {
   if (isLand(card)) return 'Las tierras se juegan, no se lanzan (CR 305.9).';
   if (!p.hand.includes(card) && !p.command.includes(card)) return 'Solo puedes lanzar desde la mano o la zona de mando (CR 601.3).';
-  const instantSpeed = /\bInstant\b/.test(card.typeLine) || has(card, 'flash');
-  if (!instantSpeed && !sorcerySpeedOK(game, p))
+  if (!isInstantSpeed(card) && !sorcerySpeedOK(game, p))
     return 'Velocidad de conjuro: solo en tu fase principal con la pila vacía (CR 307.1).';
+  const r = restrictions(game, p, card);
+  if (r) return `${r} (CR 101.2)`;
   return null;
 }
 
 export function landBlockReason(game, p, card) {
   if (!isLand(card)) return 'No es una tierra.';
   if (!p.hand.includes(card)) return 'La tierra debe estar en tu mano.';
-  if (!sorcerySpeedOK(game, p)) return 'Solo en tu fase principal con la pila vacía (CR 305.2/116.2a).';
+  if (!sorcerySpeedOK(game, p)) return 'Solo en tu fase principal con la pila vacía (CR 305.2 / 116.2a).';
   if (p.landsPlayed >= 1) return 'Ya jugaste una tierra este turno (CR 305.2).';
   return null;
 }
 
-// ---------- Acciones ----------
+// ---------- Objetivos (CR 115, 601.2c, 608.2b) ----------
+
+/** Describe el tipo de objetivo que pide una carta, o null si no tiene objetivo. */
+export function targetSpec(card) {
+  const t = (card.oracle || '').toLowerCase();
+  let m = t.match(/counter target ([a-z ,]*?)spell/);
+  if (m) return { type: 'spell', kind: m[1].trim() };
+  m = t.match(/(destroy|exile) target ((?:attacking |nonland |nontoken )?(?:creature or planeswalker|artifact or enchantment|artifact or creature|creature|artifact|enchantment|planeswalker|permanent))/);
+  if (m) return { type: 'permanent', kind: m[2] };
+  m = t.match(/deals? (\d+|x) damage to (any target|target creature or planeswalker|target creature|target attacking creature|target player|target opponent)/);
+  if (m) return { type: m[2] === 'any target' ? 'any' : /player|opponent/.test(m[2]) ? 'player' : 'permanent', kind: m[2].replace('target ', ''), amount: m[1], opponentOnly: m[2] === 'target opponent' };
+  return null;
+}
+
+const targetableBy = (c, p) => !has(c, 'shroud') && !(has(c, 'hexproof') && c.owner !== p.idx); // CR 702.11b, 702.18
+
+function permFilter(kind) {
+  kind = kind.toLowerCase();
+  return (c) => {
+    if (kind.includes('attacking')) return isCreature(c);
+    if (kind.includes('nonland')) return !isLand(c);
+    if (kind.includes('creature') && isCreature(c)) return true;
+    if (kind.includes('artifact') && /Artifact/.test(c.typeLine)) return true;
+    if (kind.includes('enchantment') && /Enchantment/.test(c.typeLine)) return true;
+    if (kind.includes('planeswalker') && isPlaneswalker(c)) return true;
+    return kind.trim() === 'permanent';
+  };
+}
+
+/** Objetivos legales serializables: {type:'card', iid} | {type:'player', idx} | {type:'stack', id} */
+export function legalTargets(game, p, spec) {
+  if (!spec) return [];
+  const out = [];
+  if (spec.type === 'spell') {
+    for (const it of game.stack) if (it.kind === 'spell' && counterMatches(spec.kind, it.card)) out.push({ type: 'stack', id: it.id });
+    return out;
+  }
+  if (spec.type === 'player' || spec.type === 'any') {
+    for (const pl of game.players) if (pl.alive && (!spec.opponentOnly || pl !== p)) out.push({ type: 'player', idx: pl.idx });
+  }
+  if (spec.type === 'permanent' || spec.type === 'any') {
+    const attackers = game.combat ? game.combat.attacks.map((a) => a.attacker) : [];
+    const filt = spec.type === 'any' ? (c) => isCreature(c) || isPlaneswalker(c) : permFilter(spec.kind);
+    for (const pl of game.players) {
+      for (const c of pl.battlefield) {
+        if (!filt(c) || !targetableBy(c, p)) continue;
+        if (spec.kind?.includes('attacking') && !attackers.includes(c)) continue;
+        out.push({ type: 'card', iid: c.iid });
+      }
+    }
+  }
+  return out;
+}
+
+function sameTarget(a, b) {
+  return a && b && a.type === b.type && (a.iid ?? a.idx ?? a.id) === (b.iid ?? b.idx ?? b.id);
+}
+
+function resolveTargetRef(game, ref) {
+  if (!ref) return null;
+  if (ref.type === 'player') return { type: 'player', player: game.players[ref.idx] };
+  if (ref.type === 'card') {
+    const loc = findCard(game, ref.iid);
+    return loc && loc.zone === 'battlefield' ? { type: 'card', card: loc.card } : null;
+  }
+  if (ref.type === 'stack') {
+    const item = game.stack.find((it) => it.id === ref.id);
+    return item ? { type: 'stack', item } : null;
+  }
+  return null;
+}
+
+function counterMatches(kind, target) {
+  if (!kind) return true;
+  if (kind.includes('noncreature')) return !isCreature(target);
+  if (kind.includes('creature')) return isCreature(target);
+  if (kind.includes('instant or sorcery')) return isInstantOrSorcery(target);
+  return true;
+}
+
+function threatScore(game, c) {
+  return (isCreature(c) ? power(game, c) + toughness(game, c) : 2) + (c.isCommander ? 8 : 0) + (c.cmc || 0);
+}
+
+function aiChooseTarget(game, p, spec, legal) {
+  if (!legal.length) return null;
+  if (spec.type === 'spell') return [...legal].reverse().find((r) => game.stack.find((it) => it.id === r.id)?.controller !== p) || null;
+  const n = num(spec.amount || 0);
+  const cards = legal.filter((r) => r.type === 'card').map((r) => ({ r, c: findCard(game, r.iid)?.card })).filter((x) => x.c && x.c.owner !== p.idx);
+  if (spec.type === 'any' || spec.type === 'permanent') {
+    const killable = cards
+      .filter(({ c }) => spec.amount == null || (isCreature(c) && toughness(game, c) - c.damage <= n))
+      .sort((a, b) => threatScore(game, b.c) - threatScore(game, a.c));
+    if (killable[0]) return killable[0].r;
+  }
+  const players = legal.filter((r) => r.type === 'player' && r.idx !== p.idx).sort((a, b) => game.players[a.idx].life - game.players[b.idx].life);
+  return players[0] || null;
+}
+
+export function opponents(game, p) {
+  return game.players.filter((o) => o !== p && o.alive);
+}
+
+function weakestOpponent(game, p) {
+  return opponents(game, p).sort((a, b) => a.life - b.life || Math.random() - 0.5)[0];
+}
+
+// ---------- Acciones de prioridad ----------
 
 export function playLand(game, p, card) {
   const why = landBlockReason(game, p, card);
@@ -337,159 +577,206 @@ export function playLand(game, p, card) {
 }
 
 /**
- * Lanza un hechizo usando la pila (CR 601, 405) y abre una ronda de prioridad (CR 117).
- * @returns {Promise<{ok:boolean, reason?:string, countered?:boolean, effects?:string[]}>}
+ * Lanza un hechizo (CR 601.2): anunciar, elegir X y objetivos, calcular coste total (con modificadores),
+ * pagar. El hechizo queda en la pila hasta que todos pasen prioridad (CR 117.4).
  */
-export async function castSpell(game, p, card, io, { x = 0, free = false, ctx = null } = {}) {
+export async function castSpell(game, p, card, io, { x = 0, target } = {}) {
   const why = castBlockReason(game, p, card);
   if (why) return { ok: false, reason: why };
+
+  // CR 601.2c: objetivos
+  const spec = targetSpec(card);
+  let chosen = null;
+  if (spec) {
+    const legal = legalTargets(game, p, spec);
+    if (!legal.length) return { ok: false, reason: 'No hay objetivos legales (CR 601.2c).' };
+    if (target && legal.some((r) => sameTarget(r, target))) chosen = target;
+    else if (aiControlled(game, p)) chosen = aiChooseTarget(game, p, spec, legal);
+    else {
+      chosen = await io.decide(p, { kind: 'target', card: card.name, iid: card.iid, spec, targets: legal });
+      if (!chosen || !legal.some((r) => sameTarget(r, chosen))) return { ok: false, reason: 'Lanzamiento cancelado.' };
+    }
+    if (!chosen) return { ok: false, reason: 'No hay objetivos adecuados.' };
+  }
+
+  // CR 601.2f-h: coste total y pago
+  const cost = costOf(game, p, card);
+  const mods = costModifiers(game, p, card);
+  if (!payCost(game, p, cost, x)) return { ok: false, reason: `Maná insuficiente para ${costText(cost, x)} (CR 601.2h).` };
   const fromCommand = p.command.includes(card);
-  if (!free && !pay(game, p, costOf(p, card), x)) return { ok: false, reason: 'Maná insuficiente o de colores incorrectos (CR 601.2h).' };
   if (fromCommand) p.commanderTax[card.iid] = (p.commanderTax[card.iid] || 0) + 2;
 
-  // Mover a la pila
   const loc = findCard(game, card.iid);
   loc.player[loc.zone].splice(loc.index, 1);
-  const item = { card, controller: p, x, ctx, countered: false };
+  const item = { id: ++stackSeq, kind: 'spell', card, controller: p, x, target: chosen };
   game.stack.push(item);
-  log(game, `✨ ${p.name} lanza ${card.name}${fromCommand ? ' desde la zona de mando (impuesto CR 903.8)' : ''}.`);
-  await io.step(card.isCommander ? 'COMMANDER' : 'CAST', `${p.name}: ${card.name}`);
-
-  // Ronda de prioridad: cada otro jugador, en orden de turno, puede responder (CR 117.3d, 405.5)
-  await priorityRound(game, p, { type: 'spell', item }, io);
-
-  game.stack.splice(game.stack.indexOf(item), 1);
-  if (item.countered) {
-    putInZoneFromStack(game, card, 'graveyard'); // CR 701.6a
-    log(game, `🚫 ${card.name} fue contrarrestado.`);
-    runSBA(game);
-    return { ok: true, countered: true, effects: [] };
-  }
-  const effects = resolve(game, item); // CR 608
-  if (effects.length) log(game, `   ↳ ${card.name}: ${effects.join(', ')}.`);
-  await flushTriggers(game, io);
-  return { ok: true, effects };
+  p.castsThisTurn.push(card.typeLine);
+  const modTxt = mods.length ? ` [${mods.map((m) => `${m.source} ${m.amount > 0 ? '+' : ''}${m.amount}`).join(', ')}, CR 601.2f]` : '';
+  log(game, `✨ ${p.name} lanza ${card.name}${fromCommand ? ' desde la zona de mando (CR 903.8)' : ''}${targetLabel(game, chosen)}${modTxt}.`);
+  await io.step(card.isCommander ? 'COMMANDER' : 'CAST', `${p.name}: ${card.name}${targetLabel(game, chosen)}`);
+  await castTriggers(game, p, card, io);
+  return { ok: true };
 }
 
-function putInZoneFromStack(game, card, zone) {
-  const owner = game.players[card.owner];
-  if (card.isToken) return;
-  if (zone === 'battlefield') card.sick = true;
-  owner[zone].push(card);
+function targetLabel(game, ref) {
+  const t = resolveTargetRef(game, ref);
+  if (!t) return '';
+  if (t.type === 'player') return ` → ${t.player.name}`;
+  if (t.type === 'card') return ` → ${t.card.name}`;
+  return ` → ${t.item.card.name}`;
 }
 
-function resolve(game, item) {
-  const { card, controller: p, x } = item;
-  if (isInstantOrSorcery(card)) {
-    const out = resolveText(game, p, card.oracle || '', { source: card, x, ctx: item.ctx });
-    putInZoneFromStack(game, card, 'graveyard'); // CR 608.2n
-    runSBA(game);
-    return out;
+/** Habilidades activadas no de maná que el motor sabe resolver (CR 602). */
+export function activatedAbilities(game, p, c) {
+  const out = [];
+  if (c.tapped || (isCreature(c) && c.sick && !has(c, 'haste'))) return out;
+  const text = c.oracle || '';
+  let m = text.match(/\{T\}, (?:Pay 1 life, )?Sacrifice [^:]+: (Search your library for [^.]+\.[^.]*\.?)/);
+  if (m) out.push({ label: 'Buscar tierra (sacrificar)', sacrifice: true, life: /Pay 1 life/.test(m[0]) ? 1 : 0, text: m[1] });
+  for (const mm of text.matchAll(/(?:^|\n)\{T\}: ((?:Create|Draw|Target player|Each opponent|[^.\n]* deals \d+ damage)[^\n]*)/g)) {
+    out.push({ label: mm[1].slice(0, 60), text: mm[1] });
   }
-  putInZoneFromStack(game, card, 'battlefield'); // CR 608.3
-  if (has(card, 'haste')) card.sick = false;
-  const etb = (card.oracle || '')
-    .split('\n')
-    .filter((l) => /^when(ever)? .* enters/i.test(l))
-    .map((l) => l.replace(/^when(ever)? [^,]* enters[^,]*, /i, ''))
-    .join('\n');
-  const out = etb ? resolveText(game, p, etb, { source: card, x }) : [];
-  runSBA(game);
   return out;
 }
 
-async function priorityRound(game, caster, ctx, io) {
-  const n = game.players.length;
-  for (let k = 1; k < n; k++) {
-    const r = game.players[(caster.idx + k) % n];
-    if (!r.alive) continue;
-    const options = responseOptions(game, r, ctx);
-    if (!options.length) continue;
-    const pick = r.isAI ? aiPickResponse(game, r, ctx, options) : await io.respond(game, r, ctx, options);
-    if (!pick) continue;
-    await castSpell(game, r, pick, io, { ctx });
-    if (ctx.type === 'spell' && ctx.item.countered) return;
+export async function activateAbility(game, p, c, index, io) {
+  const ability = activatedAbilities(game, p, c)[index];
+  if (!ability) return { ok: false, reason: 'Habilidad no disponible.' };
+  c.tapped = true; // CR 602.2: pagar costes
+  if (ability.life) p.life -= ability.life;
+  if (ability.sacrifice) moveCard(game, c, 'graveyard');
+  game.stack.push({ id: ++stackSeq, kind: 'ability', card: { ...c, name: `${c.name} (habilidad)` }, source: c, controller: p, text: ability.text });
+  log(game, `⚙ ${p.name} activa ${c.name}.`);
+  await io.step('ABILITY', c.name);
+  return { ok: true };
+}
+
+// ---------- Disparadores al lanzar (CR 603.2) ----------
+
+async function payOrNot(game, payer, amount, prompt, io) {
+  if (amount <= 0) return true;
+  if (!canPayGeneric(game, payer, amount)) return false;
+  const pay = aiControlled(game, payer)
+    ? availableMana(payer) >= amount + 1 || amount <= 1
+    : await io.decide(payer, { kind: 'payUnless', amount, ...prompt });
+  if (pay !== true && !pay) return false;
+  return payCost(game, payer, { generic: amount, pips: [], x: 0 });
+}
+
+async function castTriggers(game, caster, card, io) {
+  for (const pl of game.players) {
+    if (!pl.alive) continue;
+    for (const src of [...pl.battlefield]) {
+      const t = src.oracle || '';
+      if (pl !== caster) {
+        // Rhystic Study, Mystic Remora, Esper Sentinel…
+        const m = t.match(/whenever an opponent casts (?:a|an|their first) ((?:non)?(?:creature )?|instant or sorcery )?spell(?: each turn)?, (?:you may )?draw a card unless that player pays \{(x|\d+)\}/i);
+        if (m) {
+          const first = /their first/i.test(m[0]);
+          const kind = (m[1] || '').trim();
+          const okKind = spellMatchesKind(card, kind);
+          const isFirst = caster.castsThisTurn.filter((tl) => spellMatchesKind({ typeLine: tl }, kind)).length === 1;
+          if (okKind && (!first || isFirst)) {
+            const amount = m[2].toLowerCase() === 'x' ? Math.max(0, power(game, src)) : +m[2];
+            const paid = await payOrNot(game, caster, amount, { source: src.name, owner: pl.name, effect: `${pl.name} roba una carta` }, io);
+            if (!paid) draw(game, pl, 1);
+            log(game, `   ⚡ ${src.name} (${pl.name}): ${caster.name} ${paid ? `paga {${amount}}` : `no paga → ${pl.name} roba`} (CR 603.2).`);
+            await io.step('TRIGGER', `${src.name}: ${paid ? `${caster.name} pagó {${amount}}` : `${pl.name} roba`}`);
+          }
+        }
+        // Daño/pérdida de vida al lanzar (Ruric Thar, Kambal…)
+        const d = t.match(/whenever (?:a player|an opponent) casts (?:a|an) (noncreature )?spell, [^.]*?(?:deals (\d+) damage to that player|that player loses (\d+) life)/i);
+        if (d && spellMatchesKind(card, d[1])) {
+          const n = +(d[2] || d[3]);
+          caster.life -= n;
+          log(game, `   ⚡ ${src.name} (${pl.name}): ${caster.name} pierde ${n} (CR 603.2).`);
+        }
+      } else {
+        // "Whenever you cast …" (Talrand, Young Pyromancer, magecraft…)
+        const m = t.match(/whenever you cast (?:an?|your first) ((?:non)?(?:creature )?|instant or sorcery )?spell(?: each turn)?, ([^.\n]+)/i);
+        if (m && src !== card && spellMatchesKind(card, m[1])) {
+          const fx = resolveText(game, pl, m[2], { source: src });
+          if (fx.length) log(game, `   ⚡ ${src.name}: ${fx.join(', ')}.`);
+        }
+      }
+    }
   }
+  runSBA(game);
 }
 
-/** Respuestas posibles: instantáneos/destello pagables y relevantes al contexto. */
-export function responseOptions(game, p, ctx) {
-  return p.hand.filter((c) => {
-    if (!(/\bInstant\b/.test(c.typeLine) || has(c, 'flash')) || !canPay(game, p, c)) return false;
-    const t = (c.oracle || '').toLowerCase();
-    if (ctx.type === 'spell') return counterMatches(t, ctx.item.card) && ctx.item.controller !== p;
-    if (ctx.type === 'attack') return /(destroy|exile) target (creature|attacking creature|nonland permanent|permanent)|deals? \d+ damage to (any target|target creature|target attacking creature)/.test(t);
-    return false;
-  });
-}
+// ---------- Resolución (CR 608) ----------
 
-function counterMatches(t, target) {
-  const m = t.match(/counter target ([a-z ,]*?)spell/);
-  if (!m) return false;
-  const kind = m[1].trim();
-  if (!kind) return true;
-  if (kind.includes('noncreature')) return !isCreature(target);
-  if (kind.includes('creature')) return isCreature(target);
-  if (kind.includes('instant or sorcery')) return isInstantOrSorcery(target);
-  return true;
-}
-
-// ---------- Selección de objetivos ----------
-
-const targetable = (c) => !has(c, 'hexproof') && !has(c, 'shroud'); // CR 702.11, 702.18
-
-function targetFilter(kind) {
-  kind = kind.toLowerCase();
-  return (c) => {
-    if (kind.includes('nonland')) return !isLand(c);
-    if (kind.includes('creature') && isCreature(c)) return true;
-    if (kind.includes('artifact') && /Artifact/.test(c.typeLine)) return true;
-    if (kind.includes('enchantment') && /Enchantment/.test(c.typeLine)) return true;
-    if (kind.includes('planeswalker') && isPlaneswalker(c)) return true;
-    return kind.trim() === 'permanent';
-  };
-}
-
-function threatScore(game, c) {
-  return (isCreature(c) ? power(game, c) + toughness(game, c) : 2) + (c.isCommander ? 8 : 0) + (c.cmc || 0);
-}
-
-function bestTarget(game, p, kind, { among = null } = {}) {
-  let best = null;
-  const pool = among || opponents(game, p).flatMap((o) => o.battlefield);
-  for (const c of pool) {
-    if (!targetable(c) || !targetFilter(kind)(c)) continue;
-    const s = threatScore(game, c);
-    if (!best || s > best.s) best = { c, s };
+async function resolveTop(game, io) {
+  const item = game.stack[game.stack.length - 1];
+  const { card, controller: p } = item;
+  // CR 608.2b: si todos sus objetivos son ilegales, no se resuelve
+  if (item.target && !stillLegal(game, item)) {
+    game.stack.pop();
+    if (item.kind === 'spell') {
+      game.players[card.owner].graveyard.push(card);
+      runSBA(game);
+    }
+    log(game, `💨 ${card.name} no se resuelve: objetivo ilegal (CR 608.2b).`);
+    await io.step('FIZZLE', card.name);
+    return;
   }
-  return best?.c || null;
+  game.stack.pop();
+  let effects = [];
+  if (item.kind === 'ability') {
+    effects = resolveText(game, p, item.text, { source: item.source, target: item.target });
+  } else if (isInstantOrSorcery(card)) {
+    effects = resolveText(game, p, card.oracle || '', { source: card, x: item.x, target: item.target });
+    if (!card.isToken) game.players[card.owner].graveyard.push(card); // CR 608.2n
+  } else {
+    card.sick = true;
+    game.players[card.owner].battlefield.push(card); // CR 608.3
+    if (has(card, 'haste')) card.sick = false;
+    const etb = (card.oracle || '')
+      .split('\n')
+      .filter((l) => /^when(ever)? .* enters/i.test(l))
+      .map((l) => l.replace(/^when(ever)? [^,]* enters[^,]*, /i, ''))
+      .join('\n');
+    if (etb) effects = resolveText(game, p, etb, { source: card, x: item.x });
+  }
+  runSBA(game);
+  log(game, `   ↳ Se resuelve ${card.name}${effects.length ? ': ' + effects.join(', ') : ''}.`);
+  await io.step(labelFor(effects, item), `${card.name}${effects.length ? ' · ' + effects.join(', ') : ''}`);
+  await flushTriggers(game, io);
 }
 
-export function opponents(game, p) {
-  return game.players.filter((o) => o !== p && o.alive);
+function stillLegal(game, item) {
+  const spec = item.kind === 'spell' ? targetSpec(item.card) : null;
+  if (!spec) return true;
+  return legalTargets(game, item.controller, spec).some((r) => sameTarget(r, item.target));
 }
 
-function weakestOpponent(game, p) {
-  return opponents(game, p).sort((a, b) => a.life - b.life || Math.random() - 0.5)[0];
+function labelFor(effects, item) {
+  if (effects.some((e) => e.startsWith('BOARD WIPE'))) return 'BOARD WIPE';
+  if (effects.some((e) => e.startsWith('contrarresta'))) return 'COUNTER';
+  if (effects.some((e) => /destruye|exilia/.test(e))) return 'REMOVAL';
+  if (effects.some((e) => e.startsWith('crea'))) return 'TOKENS';
+  if (effects.some((e) => e.startsWith('busca'))) return 'RAMP';
+  return item.card?.isCommander ? 'COMMANDER' : 'RESOLVE';
 }
-
-// ---------- Resolución de texto ----------
 
 /** Resuelve los efectos más comunes leyendo el texto Oracle. */
-export function resolveText(game, p, text, { source = null, x = 0, ctx = null, defender = null } = {}) {
+export function resolveText(game, p, text, { source = null, x = 0, target = null, defender = null } = {}) {
   const t = text.toLowerCase();
   const out = [];
+  const tgt = resolveTargetRef(game, target);
   let m;
 
   // Contrarrestar (CR 701.6)
-  if (/counter target [a-z ,]*spell/.test(t) && ctx?.type === 'spell' && game.stack.includes(ctx.item)) {
-    ctx.item.countered = true;
-    out.push(`contrarresta ${ctx.item.card.name}`);
+  if (/counter target [a-z ,]*spell/.test(t) && tgt?.type === 'stack') {
+    const it = tgt.item;
+    game.stack.splice(game.stack.indexOf(it), 1);
+    if (it.kind === 'spell' && !it.card.isToken) game.players[it.card.owner].graveyard.push(it.card); // CR 701.6a
+    out.push(`contrarresta ${it.card.name}`);
   }
 
   // Board wipes
   if ((m = t.match(/(destroy|exile) all (creatures|nonland permanents|artifacts|enchantments)/))) {
-    const filt = targetFilter(m[2]);
+    const filt = permFilter(m[2]);
     let n = 0;
     for (const pl of game.players) {
       for (const c of [...pl.battlefield]) {
@@ -505,16 +792,13 @@ export function resolveText(game, p, text, { source = null, x = 0, ctx = null, d
     out.push(`todas las criaturas -${m[1]}/-${m[2]}`);
   }
 
-  // Removal puntual (en combate apunta al atacante más peligroso)
-  if ((m = t.match(/(destroy|exile) target ((?:attacking |nonland |nontoken )?(?:creature or planeswalker|artifact or enchantment|artifact or creature|creature|artifact|enchantment|planeswalker|permanent))/))) {
-    const among = ctx?.type === 'attack' ? ctx.attackers : null;
-    const target = bestTarget(game, p, m[2], { among });
-    if (target) {
-      if (m[1] === 'destroy' && has(target, 'indestructible')) out.push(`${target.name} es indestructible`);
-      else {
-        moveCard(game, target, m[1] === 'exile' ? 'exile' : 'graveyard');
-        out.push(`${m[1] === 'exile' ? 'exilia' : 'destruye'} ${target.name}`);
-      }
+  // Removal con objetivo
+  if ((m = t.match(/(destroy|exile) target /)) && tgt?.type === 'card') {
+    const c = tgt.card;
+    if (m[1] === 'destroy' && has(c, 'indestructible')) out.push(`${c.name} es indestructible`);
+    else {
+      moveCard(game, c, m[1] === 'exile' ? 'exile' : 'graveyard');
+      out.push(`${m[1] === 'exile' ? 'exilia' : 'destruye'} ${c.name}`);
     }
   }
 
@@ -526,23 +810,15 @@ export function resolveText(game, p, text, { source = null, x = 0, ctx = null, d
   } else if ((m = t.match(/deals? (\d+|x) damage to the player or planeswalker it's attacking/)) && defender) {
     defender.life -= num(m[1], x);
     out.push(`${num(m[1], x)} de daño a ${defender.name}`);
-  } else if ((m = t.match(/deals? (\d+|x) damage to (any target|target creature|target attacking creature|target player|target opponent)/))) {
+  } else if ((m = t.match(/deals? (\d+|x) damage to (?:any target|target [a-z ]+)/)) && tgt) {
     const n = num(m[1], x);
-    const among = ctx?.type === 'attack' ? ctx.attackers : null;
-    const kill = m[2].includes('player') || m[2].includes('opponent')
-      ? null
-      : (among || opponents(game, p).flatMap((o) => o.battlefield)).filter(
-          (c) => isCreature(c) && targetable(c) && toughness(game, c) - c.damage <= n
-        ).sort((a, b) => threatScore(game, b) - threatScore(game, a))[0];
-    if (kill) {
-      kill.damage += n;
-      out.push(`${n} de daño a ${kill.name}`);
-    } else if (!m[2].includes('creature')) {
-      const o = weakestOpponent(game, p);
-      if (o) {
-        o.life -= n;
-        out.push(`${n} de daño a ${o.name}`);
-      }
+    if (tgt.type === 'player') {
+      tgt.player.life -= n;
+      out.push(`${n} de daño a ${tgt.player.name}`);
+    } else if (tgt.type === 'card') {
+      tgt.card.damage += n;
+      if (isPlaneswalker(tgt.card)) tgt.card.counters.loyalty -= n;
+      out.push(`${n} de daño a ${tgt.card.name}`);
     }
   }
 
@@ -562,7 +838,7 @@ export function resolveText(game, p, text, { source = null, x = 0, ctx = null, d
     out.push(`+${m[1]} vida`);
   }
 
-  // Sacrificio forzado (Grave Pact y similares). El jugador elige: la IA sacrifica la más débil.
+  // Sacrificio forzado (Grave Pact): cada jugador elige; se elige la criatura más débil.
   if (/each (?:other player|opponent) sacrifices a creature/.test(t)) {
     for (const o of opponents(game, p)) {
       const c = o.battlefield.filter(isCreature).sort((a, b) => threatScore(game, a) - threatScore(game, b))[0];
@@ -580,7 +856,7 @@ export function resolveText(game, p, text, { source = null, x = 0, ctx = null, d
     out.push(`roba ${n}`);
   }
 
-  // Ramp: buscar tierras (Cultivate, Rampant Growth, Evolving Wilds…)
+  // Buscar tierras (Cultivate, Rampant Growth, fetchlands…)
   if ((m = t.match(/search your library for (a|an|up to (?:one|two|three)) (basic land|basic [a-z]+|land|[a-z]+ or [a-z]+) cards?/))) {
     const n = /up to (\w+)/.test(m[1]) ? num(m[1].split(' ').pop()) : 1;
     const words = m[2].replace('basic ', '').split(/ or /).map((w) => w.trim());
@@ -603,7 +879,7 @@ export function resolveText(game, p, text, { source = null, x = 0, ctx = null, d
   // Contadores +1/+1 masivos
   if ((m = t.match(/put (a|two|\d+) \+1\/\+1 counters? on each creature you control/))) {
     for (const c of p.battlefield) if (isCreature(c)) c.counters.p1 += num(m[1]);
-    out.push(`+1/+1 a tus criaturas`);
+    out.push('+1/+1 a tus criaturas');
   }
 
   // Tokens de criatura (CR 111)
@@ -616,14 +892,22 @@ export function resolveText(game, p, text, { source = null, x = 0, ctx = null, d
     const made = createTokens(game, p, n, +m[3], +m[4], sub, kws, !!m[2]);
     out.push(`crea ${made} token${made !== 1 ? 's' : ''} ${m[3]}/${m[4]}`);
   }
+  // Tokens de artefacto (Treasure, Clue, Food)
+  if ((m = t.match(/create (a|one|two|three|four|x|\d+) (tapped )?(treasure|clue|food) tokens?/))) {
+    const n = num(m[1], x);
+    for (let i = 0; i < n; i++) {
+      const tk = makeArtifactToken(p.idx, m[3]);
+      tk.tapped = !!m[2];
+      p.battlefield.push(tk);
+    }
+    out.push(`crea ${n} ${cap(m[3])}`);
+  }
 
   runSBA(game);
   return out;
 }
 
-const cap = (s) => s.replace(/\b\w/g, (c) => c.toUpperCase());
-
-/** Crea tokens aplicando efectos de reemplazo (CR 614) como Chatterfang o Parallel Lives. */
+/** Crea tokens aplicando efectos de reemplazo (CR 614): Chatterfang, Parallel Lives… */
 function createTokens(game, p, n, pw, tg, sub, kws = [], tapped = false) {
   if (n <= 0) return 0;
   let count = n;
@@ -642,85 +926,97 @@ function createTokens(game, p, n, pw, tg, sub, kws = [], tapped = false) {
   return count + squirrels;
 }
 
-// ---------- Habilidades activadas sencillas ----------
-
-/** Habilidades "{T}: …" no de maná y fetchlands que el motor sabe resolver. */
-export function activatedAbilities(game, p, c) {
-  const out = [];
-  if (c.tapped || (isCreature(c) && c.sick && !has(c, 'haste'))) return out;
-  const text = c.oracle || '';
-  let m = text.match(/\{T\}, (?:Pay 1 life, )?Sacrifice [^:]+: (Search your library for [^.]+\.[^.]*\.?)/);
-  if (m) out.push({ label: 'Buscar tierra (sacrificar)', sacrifice: true, life: /Pay 1 life/.test(m[0]) ? 1 : 0, text: m[1] });
-  for (const mm of text.matchAll(/(?:^|\n)\{T\}: ((?:Create|Draw|Target player|Each opponent|[^.]* deals \d+ damage)[^\n]*)/g)) {
-    out.push({ label: mm[1].slice(0, 60), text: mm[1] });
-  }
-  return out;
-}
-
-export async function activate(game, p, c, ability, io) {
-  c.tapped = true; // CR 602.2: pagar costes ({T}, vida, sacrificio)
-  if (ability.life) p.life -= ability.life;
-  if (ability.sacrifice) moveCard(game, c, 'graveyard');
-  const effects = resolveText(game, p, ability.text, { source: c });
-  log(game, `⚙ ${p.name} activa ${c.name}${effects.length ? ': ' + effects.join(', ') : ''}.`);
-  await flushTriggers(game, io);
-  return effects;
-}
-
 // ---------- Disparadores (CR 603) ----------
 
-function triggerMatches(subject, src, event) {
+function triggerMatches(subject, src, dead) {
   let s = subject.toLowerCase().trim();
-  const dead = event.card;
   const nm = src.name.toLowerCase();
   if (s === nm || s === 'this creature') return dead.iid === src.iid;
   if (s.startsWith(`${nm} or `)) {
     if (dead.iid === src.iid) return true;
     s = s.slice(nm.length + 4);
   }
-  const yours = /you control/.test(s);
-  const another = /another/.test(s);
-  const nontoken = /nontoken/.test(s);
   if (!/creature/.test(s)) return false;
-  if (yours && dead.owner !== src.owner) return false;
-  if (another && dead.iid === src.iid) return false;
-  if (nontoken && dead.isToken) return false;
+  if (/you control/.test(s) && dead.owner !== src.owner) return false;
+  if (/another/.test(s) && dead.iid === src.iid) return false;
+  if (/nontoken/.test(s) && dead.isToken) return false;
   return true;
 }
 
-/** Resuelve disparadores pendientes ("dies" y similares) en orden APNAP (CR 603.3b). */
+/** Resuelve disparadores pendientes en orden APNAP (CR 603.3b). */
 export async function flushTriggers(game, io) {
-  for (let guard = 0; guard < 40 && game.pendingTriggers.length; guard++) {
+  for (let guard = 0; guard < 60 && game.pendingTriggers.length; guard++) {
     const ev = game.pendingTriggers.shift();
-    const order = game.players.map((_, k) => game.players[(game.active + k) % game.players.length]);
-    for (const pl of order) {
-      const sources = [...pl.battlefield];
-      if (ev.card.owner === pl.idx && !sources.some((s) => s.iid === ev.card.iid)) sources.push(ev.card); // CR 603.10a
-      for (const src of sources) {
-        for (const m of (src.oracle || '').matchAll(/(?:^|\n|\. )(?:when|whenever) ([^,]*?) dies, ([^.\n]+)/gi)) {
-          if (!pl.alive || !triggerMatches(m[1], src, ev)) continue;
-          const effects = resolveText(game, pl, m[2], { source: src });
-          if (effects.length) log(game, `   ⚡ ${src.name}: ${effects.join(', ')} (CR 603).`);
+    const n = game.players.length;
+    const order = game.players.map((_, k) => game.players[(game.active + k) % n]);
+    if (ev.type === 'dies') {
+      for (const pl of order) {
+        if (!pl.alive) continue;
+        const sources = [...pl.battlefield];
+        if (ev.card.owner === pl.idx && !sources.some((s) => s.iid === ev.card.iid)) sources.push(ev.card); // CR 603.10a
+        for (const src of sources) {
+          for (const m of (src.oracle || '').matchAll(/(?:^|\n|\. )(?:when|whenever) ([^,]*?) dies, ([^.\n]+)/gi)) {
+            if (!triggerMatches(m[1], src, ev.card)) continue;
+            const fx = resolveText(game, pl, m[2], { source: src });
+            if (fx.length) log(game, `   ⚡ ${src.name}: ${fx.join(', ')} (CR 603).`);
+          }
+        }
+      }
+    } else if (ev.type === 'draw') {
+      const drawer = game.players[ev.player];
+      for (const pl of order) {
+        if (pl === drawer || !pl.alive || !drawer.alive) continue;
+        for (const src of pl.battlefield) {
+          // Smothering Tithe y similares
+          const m = (src.oracle || '').match(/whenever an opponent draws a card, that player may pay \{(\d+)\}\. if (?:the player|they) do(?:es)?n't, you create an? (treasure|clue|food) token/i);
+          if (!m) continue;
+          const paid = await payOrNot(game, drawer, +m[1], { source: src.name, owner: pl.name, effect: `${pl.name} crea un ${cap(m[2])}` }, io);
+          if (!paid) pl.battlefield.push(makeArtifactToken(pl.idx, m[2].toLowerCase()));
+          log(game, `   ⚡ ${src.name} (${pl.name}): ${drawer.name} ${paid ? `paga {${m[1]}}` : `no paga → ${cap(m[2])}`}.`);
         }
       }
     }
   }
   runSBA(game);
-  void io;
 }
 
 function fireTriggers(game, p, pattern, extra = {}) {
-  const fired = [];
   for (const src of [...p.battlefield]) {
     for (const m of (src.oracle || '').matchAll(pattern)) {
-      const effects = resolveText(game, p, m[m.length - 1], { source: src, ...extra });
-      if (effects.length) {
-        fired.push(`${src.name}: ${effects.join(', ')}`);
-        log(game, `   ⚡ ${src.name}: ${effects.join(', ')}.`);
-      }
+      const fx = resolveText(game, p, m[m.length - 1], { source: src, ...extra });
+      if (fx.length) log(game, `   ⚡ ${src.name}: ${fx.join(', ')}.`);
     }
   }
-  return fired;
+}
+
+// ---------- Avisos automáticos ----------
+
+/** Efectos de otros jugadores que afectan a `p` (para avisar en la UI). */
+export function activeEffects(game, p) {
+  const out = [];
+  for (const pl of game.players) {
+    if (!pl.alive) continue;
+    for (const src of pl.battlefield) {
+      const t = src.oracle || '';
+      const tag = `${src.name}${pl === p ? '' : ` (${pl.name})`}`;
+      for (const m of t.matchAll(/((?:non)?(?:creature|artifact|enchantment|instant|sorcery|planeswalker)(?: and (?:instant|sorcery))? )?spells( your opponents cast| you cast| each opponent casts)? costs? \{(\d+)\} (more|less) to cast/gi)) {
+        const who = (m[2] || '').trim();
+        if ((who.includes('opponent') && pl === p) || (who === 'you cast' && pl !== p)) continue;
+        out.push({ icon: m[4].toLowerCase() === 'more' ? '💸' : '💰', text: `${tag}: hechizos ${m[1] ? m[1].trim() + ' ' : ''}cuestan {${m[3]}} ${m[4].toLowerCase() === 'more' ? 'más' : 'menos'} (CR 601.2f)` });
+      }
+      if (pl === p) continue;
+      let m = t.match(/whenever an opponent casts (?:a|an|their first) ((?:non)?(?:creature )?|instant or sorcery )?spell(?: each turn)?, (?:you may )?draw a card unless that player pays \{(x|\d+)\}/i);
+      if (m) out.push({ icon: '🔔', text: `${tag}: cuando lances ${/their first/i.test(m[0]) ? 'tu primer ' : 'un '}hechizo ${m[1] ? m[1].trim() + ' ' : ''}paga {${m[2].toUpperCase() === 'X' ? power(game, src) : m[2]}} o roba` });
+      m = t.match(/the first ((?:non)?(?:creature )?)?spell each opponent casts (?:each|during each of your) turns? costs \{(\d+)\} more/i);
+      if (m) out.push({ icon: '💸', text: `${tag}: tu primer hechizo ${m[1] ? m[1].trim() + ' ' : ''}de cada turno cuesta {${m[2]}} más` });
+      if (/whenever an opponent draws a card, that player may pay/i.test(t)) out.push({ icon: '🪙', text: `${tag}: cada vez que robes, paga {2} o crea un Treasure` });
+      if (/can't cast more than one spell each turn/i.test(t)) out.push({ icon: '⛔', text: `${tag}: solo un hechizo por turno` });
+      if (/your opponents can't cast spells during your turn/i.test(t)) out.push({ icon: '⛔', text: `${tag}: no puedes lanzar hechizos en su turno` });
+      m = t.match(/whenever (?:a player|an opponent) casts (?:a|an) (noncreature )?spell, [^.]*?(?:deals (\d+) damage to that player|that player loses (\d+) life)/i);
+      if (m) out.push({ icon: '🔥', text: `${tag}: pierdes ${m[2] || m[3]} al lanzar un hechizo ${m[1] ? 'no criatura' : ''}` });
+    }
+  }
+  return out;
 }
 
 // ---------- Acciones basadas en estado (CR 704) ----------
@@ -757,7 +1053,7 @@ export function runSBA(game) {
             continue;
           }
         }
-        if (isPlaneswalker(c) && c.counters.loyalty <= 0 && c.loyalty != null) {
+        if (isPlaneswalker(c) && c.loyalty != null && c.counters.loyalty <= 0) {
           moveCard(game, c, 'graveyard'); // CR 704.5i
           changed = true;
           continue;
@@ -768,7 +1064,6 @@ export function runSBA(game) {
           c.counters.m1 -= k;
         }
       }
-      // Regla de leyenda (CR 704.5j): se queda la más reciente
       const byName = new Map();
       for (const c of p.battlefield.filter(isLegendary)) {
         if (!byName.has(c.name)) byName.set(c.name, []);
@@ -776,15 +1071,14 @@ export function runSBA(game) {
       }
       for (const [name, list] of byName) {
         if (list.length < 2) continue;
-        list.sort((a, b) => b.iid - a.iid).slice(1).forEach((c) => moveCard(game, c, 'graveyard'));
+        list.sort((a, b) => b.iid - a.iid).slice(1).forEach((c) => moveCard(game, c, 'graveyard')); // CR 704.5j
         log(game, `👑 Regla de leyenda: ${p.name} conserva un solo ${name} (CR 704.5j).`);
         changed = true;
       }
-      // Comandante en cementerio/exilio -> zona de mando (CR 903.9a)
       for (const zone of ['graveyard', 'exile']) {
         for (const c of [...p[zone]]) {
           if (!c.isCommander) continue;
-          p[zone].splice(p[zone].indexOf(c), 1);
+          p[zone].splice(p[zone].indexOf(c), 1); // CR 903.9a
           p.command.push(c);
           changed = true;
         }
@@ -797,9 +1091,9 @@ export function runSBA(game) {
 export function eliminate(game, p, reason) {
   if (!p.alive) return;
   p.alive = false;
-  // CR 800.4a: los objetos del jugador que abandona la partida dejan la partida
   for (const c of p.battlefield) game.combat?.remove(c);
-  p.battlefield = [];
+  p.battlefield = []; // CR 800.4a
+  game.stack = game.stack.filter((it) => it.controller !== p);
   log(game, `☠️ ${p.name} pierde: ${reason}.`);
   const alive = game.players.filter((x) => x.alive);
   if (alive.length === 1 && game.winner == null) {
@@ -808,52 +1102,209 @@ export function eliminate(game, p, reason) {
   }
 }
 
+// ---------- Prioridad (CR 117) ----------
+
+/** Opciones a velocidad de instantáneo (para decidir si vale la pena detenerse). */
+export function instantOptions(game, p) {
+  const spells = [...p.hand, ...p.command].filter((c) => {
+    if (!isInstantSpeed(c) || isLand(c) || castBlockReason(game, p, c) || !canPay(game, p, c)) return false;
+    const spec = targetSpec(c);
+    return !spec || legalTargets(game, p, spec).length > 0;
+  });
+  const abilities = p.battlefield.filter((c) => activatedAbilities(game, p, c).length);
+  return spells.length + abilities.length;
+}
+
+/** ¿Debe detenerse un humano para recibir prioridad? (paradas inteligentes) */
+function humanWantsPriority(game, p) {
+  if (p.autoPassTurn === game.turnId) return false;
+  if (game.active === p.idx && MAIN_STEPS.includes(game.step) && !game.stack.length) return true;
+  if (!instantOptions(game, p)) return false;
+  if (game.settings.fullStops) return true;
+  const top = game.stack[game.stack.length - 1];
+  if (top && top.controller !== p) return true;
+  if (game.step === 'declareAttackers' && game.combat?.attacks.some((a) => a.defender === p)) return true;
+  if (game.step === 'end' && game.active !== p.idx) return true;
+  return false;
+}
+
+async function getPriorityAction(game, p, io) {
+  if (aiControlled(game, p)) return aiPriorityAction(game, p);
+  if (!humanWantsPriority(game, p)) return PASS;
+  const error = p.lastError;
+  p.lastError = null;
+  const act = (await io.decide(p, { kind: 'priority', step: game.step, error, stack: game.stack.length })) || PASS;
+  if (act.type === 'passTurn') {
+    p.autoPassTurn = game.turnId;
+    return PASS;
+  }
+  if (act.type === 'aiForMe') {
+    p.aiTurn = game.turnId;
+    return aiPriorityAction(game, p);
+  }
+  return act;
+}
+
+async function performAction(game, p, act, io) {
+  const find = (zones) => {
+    for (const z of zones) {
+      const c = p[z].find((x) => x.iid === act.iid);
+      if (c) return c;
+    }
+    return null;
+  };
+  if (act.type === 'land') {
+    const c = find(['hand']);
+    return c ? playLand(game, p, c) : { ok: false, reason: 'Carta no encontrada.' };
+  }
+  if (act.type === 'cast') {
+    const c = find(['hand', 'command']);
+    return c ? castSpell(game, p, c, io, { x: act.x || 0, target: act.target }) : { ok: false, reason: 'Carta no encontrada.' };
+  }
+  if (act.type === 'activate') {
+    const c = find(['battlefield']);
+    return c ? activateAbility(game, p, c, act.index || 0, io) : { ok: false, reason: 'Permanente no encontrado.' };
+  }
+  return { ok: false, reason: 'Acción desconocida.' };
+}
+
+/**
+ * Ronda de prioridad: empieza el jugador activo (CR 117.3a). Si todos pasan en sucesión con la pila
+ * vacía, termina el paso (CR 500.2); si la pila tiene algo, se resuelve el objeto de arriba (CR 117.4).
+ */
+export async function priorityLoop(game, io) {
+  const n = game.players.length;
+  let passes = 0;
+  let cur = game.active;
+  for (let guard = 0; guard < 3000; guard++) {
+    if (game.winner != null || game.aborted) return;
+    const alive = game.players.filter((x) => x.alive).length;
+    if (passes >= alive) {
+      if (!game.stack.length) return;
+      await resolveTop(game, io);
+      passes = 0;
+      cur = game.active; // CR 117.3b
+      continue;
+    }
+    const pl = game.players[cur];
+    if (!pl.alive) {
+      cur = (cur + 1) % n;
+      continue;
+    }
+    const act = await getPriorityAction(game, pl, io);
+    if (!act || act.type === 'pass') {
+      passes++;
+      cur = (cur + 1) % n;
+      continue;
+    }
+    const res = await performAction(game, pl, act, io);
+    if (res.ok) {
+      passes = 0; // CR 117.3c: quien actúa recibe prioridad de nuevo
+      await flushTriggers(game, io);
+    } else if (aiControlled(game, pl)) {
+      passes++;
+      cur = (cur + 1) % n;
+    } else {
+      pl.lastError = res.reason;
+    }
+  }
+}
+
 // ---------- Estructura del turno (CR 500) ----------
 
-export async function beginTurn(game, io) {
+export async function takeTurn(game, io) {
   const p = game.players[game.active];
+  // Si el jugador activo pierde a mitad de turno, el turno termina (CR 800.4a)
+  const stop = () => {
+    if (game.winner != null || game.aborted) return true;
+    if (!p.alive) {
+      game.stack = [];
+      game.combat = null;
+      nextTurn(game);
+      return true;
+    }
+    return false;
+  };
+  game.turnId++;
+  for (const pl of game.players) pl.castsThisTurn = [];
   p.landsPlayed = 0;
+
+  // 502 Untap (sin prioridad, CR 502.4)
   setStep(game, 'untap');
   for (const c of p.battlefield) {
     if (!/doesn't untap during/i.test(c.oracle || '')) c.tapped = false; // CR 502.3
-    c.sick = false; // CR 302.6: bajo su control desde el inicio del turno
+    c.sick = false; // CR 302.6
   }
+  // 503 Upkeep
   setStep(game, 'upkeep');
   fireTriggers(game, p, /at the beginning of your upkeep, ([^.\n]+)/gi);
+  await io.step('UNTAP · UPKEEP', p.name);
+  await flushTriggers(game, io);
+  await priorityLoop(game, io);
+  if (stop()) return;
+
+  // 504 Draw — CR 103.8a / 103.8c
   setStep(game, 'draw');
-  // CR 103.8a: en partidas de dos jugadores, quien empieza no roba su primer turno.
-  // CR 103.8c: en las demás partidas multijugador nadie se salta el robo.
   const skip = game.players.length === 2 && game.active === game.firstPlayer && p.turnsTaken === 0;
   if (!skip) draw(game, p, 1);
   p.turnsTaken++;
-  log(game, `▶ Turno ${game.turn}: ${p.name}${skip ? ' (sin robar, CR 103.8a)' : ''}.`);
-  await io.step('UNTAP · UPKEEP · DRAW', p.name);
+  log(game, `▶ Turno ${game.turn}: ${p.name}${skip ? ' (no roba, CR 103.8a)' : ''}.`);
+  await io.step('DRAW', p.name);
   await flushTriggers(game, io);
-  setStep(game, 'main1');
-}
+  await priorityLoop(game, io);
+  if (stop()) return;
 
-export async function endTurn(game, io) {
-  const p = game.players[game.active];
-  if (game.winner != null) return;
+  // 505 Main 1
+  setStep(game, 'main1');
+  await priorityLoop(game, io);
+  if (stop()) return;
+
+  // 506 Combat
+  await combatPhase(game, p, io);
+  if (stop()) return;
+
+  // 505 Main 2
+  setStep(game, 'main2');
+  await priorityLoop(game, io);
+  if (stop()) return;
+
+  // 513 End
   setStep(game, 'end');
   fireTriggers(game, p, /at the beginning of your end step, ([^.\n]+)/gi);
   await flushTriggers(game, io);
+  await io.step('END STEP', p.name);
+  await priorityLoop(game, io);
+  if (stop()) return;
+
+  // 514 Cleanup
+  await cleanup(game, p, io);
+  nextTurn(game);
+}
+
+async function cleanup(game, p, io) {
   setStep(game, 'cleanup');
-  // CR 514.1: descartar hasta el tamaño máximo de mano
-  const excess = p.hand.length - (/no maximum hand size/i.test(p.battlefield.map((c) => c.oracle).join('\n')) ? Infinity : MAX_HAND);
+  const noMax = p.battlefield.some((c) => /you have no maximum hand size/i.test(c.oracle || ''));
+  const excess = noMax ? 0 : p.hand.length - MAX_HAND;
   if (excess > 0 && p.alive) {
-    const discards = p.isAI ? aiDiscard(p, excess) : await io.chooseDiscard(game, p, excess);
-    for (const c of discards.slice(0, excess)) moveCard(game, c, 'graveyard');
+    let chosen = [];
+    if (!aiControlled(game, p)) {
+      const ids = await io.decide(p, { kind: 'discard', n: excess });
+      chosen = (Array.isArray(ids) ? ids : []).map((id) => p.hand.find((c) => c.iid === id)).filter(Boolean).slice(0, excess);
+    }
+    if (chosen.length < excess) chosen.push(...aiDiscard(p, excess).filter((c) => !chosen.includes(c)).slice(0, excess - chosen.length));
+    for (const c of chosen) moveCard(game, c, 'graveyard');
     log(game, `🗑 ${p.name} descarta ${excess} (CR 514.1).`);
   }
-  // CR 514.2: se quita el daño y terminan los efectos "hasta el final del turno"
   for (const pl of game.players) {
     for (const c of pl.battlefield) {
-      c.damage = 0;
+      c.damage = 0; // CR 514.2
       c.deathtouched = false;
       c.tempP = c.tempT = 0;
     }
   }
+}
+
+function nextTurn(game) {
   const n = game.players.length;
   let next = game.active;
   for (let i = 0; i < n; i++) {
@@ -879,20 +1330,19 @@ export function canBlock(game, blocker, attacker) {
   if (/can't block/i.test(blocker.oracle || '')) return false;
   if (has(attacker, 'flying') && !has(blocker, 'flying') && !has(blocker, 'reach')) return false; // CR 702.9b
   if (/can't be blocked/i.test(attacker.oracle || '') && !/can't be blocked except/i.test(attacker.oracle || '')) return false;
-  if (/forestwalk/i.test((attacker.keywords || []).join(' ')) && game.players[blocker.owner].battlefield.some((l) => /Forest/.test(l.typeLine)))
-    return false; // CR 702.14
+  if (has(attacker, 'forestwalk') && game.players[blocker.owner].battlefield.some((l) => /Forest/.test(l.typeLine))) return false; // CR 702.14
   return true;
 }
 
-/** Valida y limpia bloqueos ilegales (CR 509.1b-c): menace (702.111b) exige 2+ bloqueadores. */
+/** Limpia bloqueos ilegales (CR 509.1b-c): menace (702.111b) exige 2+ bloqueadores. */
 export function validateBlocks(game, blocks) {
-  const usedBlockers = new Set();
+  const used = new Set();
   const clean = new Map();
   for (const [a, list] of blocks) {
-    const legal = list.filter((b) => !usedBlockers.has(b) && canBlock(game, b, a));
+    const legal = list.filter((b) => !used.has(b) && canBlock(game, b, a));
     if (has(a, 'menace') && legal.length === 1) continue;
     if (!legal.length) continue;
-    legal.forEach((b) => usedBlockers.add(b));
+    legal.forEach((b) => used.add(b));
     clean.set(a, legal);
   }
   return clean;
@@ -902,6 +1352,7 @@ class Combat {
   constructor(attacker) {
     this.attackingPlayer = attacker;
     this.attacks = []; // { attacker, defender, blockers: [], blocked: false }
+    this.dealtFirst = new Set();
   }
   remove(card) {
     this.attacks = this.attacks.filter((a) => a.attacker !== card);
@@ -909,19 +1360,10 @@ class Combat {
   }
 }
 
-/**
- * Ejecuta el combate completo.
- * @param {{attacker:object, defender:object}[]} plan
- */
-export async function runCombat(game, p, plan, io) {
-  setStep(game, 'beginCombat');
-  const legal = plan.filter(({ attacker, defender }) => canAttack(game, attacker) && defender.alive && defender !== p);
-  if (!legal.length) {
-    setStep(game, 'main2');
-    return 'Sin atacantes';
-  }
-
-  setStep(game, 'declareAttackers');
+/** Declara el ataque a partir de un plan. Exportada para tests y para la UI manual. */
+export async function declareAttack(game, p, plan, io) {
+  const legal = plan.filter(({ attacker, defender }) => attacker && defender && canAttack(game, attacker) && defender.alive && defender !== p);
+  if (!legal.length) return false;
   const combat = new Combat(p);
   game.combat = combat;
   for (const { attacker, defender } of legal) {
@@ -930,66 +1372,127 @@ export async function runCombat(game, p, plan, io) {
   }
   const targets = [...new Set(legal.map((a) => a.defender.name))].join(', ');
   log(game, `⚔️ ${p.name} ataca con ${legal.length} criatura${legal.length > 1 ? 's' : ''} → ${targets} (CR 508).`);
-  // Disparadores de ataque (CR 508.3)
   for (const a of combat.attacks) {
     const nm = escRe(a.attacker.name);
     for (const m of (a.attacker.oracle || '').matchAll(new RegExp(`whenever ${nm} attacks, ([^.\\n]+)`, 'gi'))) {
-      resolveText(game, p, m[1], { source: a.attacker, defender: a.defender });
+      resolveText(game, p, m[1], { source: a.attacker, defender: a.defender }); // CR 508.3a
     }
   }
   fireTriggers(game, p, /whenever (?:a|another) creature you control attacks, ([^.\n]+)/gi, { defender: legal[0].defender });
   fireTriggers(game, p, /whenever you attack, ([^.\n]+)/gi, { defender: legal[0].defender });
   await io.step('COMBAT', `${p.name} → ${targets}`);
+  return true;
+}
 
-  // Prioridad tras declarar atacantes: los defensores pueden responder (CR 508.8)
-  for (const d of opponents(game, p)) {
-    const attackers = combat.attacks.filter((a) => a.defender === d).map((a) => a.attacker);
-    if (!attackers.length) continue;
-    const ctx = { type: 'attack', attackers };
-    const options = responseOptions(game, d, ctx);
-    if (!options.length) continue;
-    const pick = d.isAI ? aiPickResponse(game, d, ctx, options) : await io.respond(game, d, ctx, options);
-    if (pick) await castSpell(game, d, pick, io, { ctx });
+export async function combatPhase(game, p, io) {
+  // 507 Beginning of combat
+  setStep(game, 'beginCombat');
+  fireTriggers(game, p, /at the beginning of combat on your turn, ([^.\n]+)/gi);
+  await flushTriggers(game, io);
+  await priorityLoop(game, io);
+  if (game.winner != null || game.aborted) return;
+
+  // 508 Declare attackers
+  setStep(game, 'declareAttackers');
+  const eligible = p.battlefield.filter((c) => canAttack(game, c));
+  let plan = [];
+  if (eligible.length && opponents(game, p).length) {
+    if (aiControlled(game, p)) plan = aiPlanAttacks(game, p);
+    else {
+      const v = await io.decide(p, {
+        kind: 'attackers',
+        attackers: eligible.map((c) => c.iid),
+        defenders: opponents(game, p).map((o) => o.idx),
+      });
+      plan = (Array.isArray(v) ? v : []).map((x) => ({
+        attacker: eligible.find((c) => c.iid === x.attacker),
+        defender: game.players[x.defender],
+      }));
+    }
   }
-  if (!combat.attacks.length) return endCombat(game, 'Ataque neutralizado');
+  const attacked = await declareAttack(game, p, plan, io);
+  if (!attacked) {
+    setStep(game, 'endCombat'); // CR 508.8: sin atacantes se saltan bloqueos y daño
+    game.combat = null;
+    return;
+  }
+  await flushTriggers(game, io);
+  await priorityLoop(game, io);
+  if (game.winner != null || game.aborted || !game.combat?.attacks.length) return endCombat(game, io);
 
-  // Declarar bloqueadores (CR 509)
+  // 509 Declare blockers
   setStep(game, 'declareBlockers');
+  await declareBlocks(game, p, io);
+  await priorityLoop(game, io);
+  if (game.winner != null || game.aborted) return;
+
+  // 510 Combat damage
+  setStep(game, 'combatDamage');
+  const combat = game.combat;
+  if (combat) {
+    const fs = (c) => has(c, 'first strike') || has(c, 'double strike');
+    const anyFirst = combat.attacks.some((a) => fs(a.attacker) || a.blockers.some(fs));
+    if (anyFirst) {
+      const s = dealCombatDamage(game, combat, 'first'); // CR 510.4
+      await io.step('FIRST STRIKE', s);
+      await flushTriggers(game, io);
+      await priorityLoop(game, io);
+    }
+    if (game.combat && game.winner == null) {
+      const s = dealCombatDamage(game, game.combat, anyFirst ? 'regular' : 'only');
+      await flushTriggers(game, io);
+      await io.step('DAMAGE', s);
+      await priorityLoop(game, io);
+    }
+  }
+  await endCombat(game, io);
+}
+
+async function endCombat(game, io) {
+  setStep(game, 'endCombat'); // CR 511
+  if (game.winner == null && !game.aborted) await priorityLoop(game, io);
+  game.combat = null;
+}
+
+async function declareBlocks(game, p, io) {
+  const combat = game.combat;
   const summary = [];
-  for (const d of opponents(game, p)) {
+  const n = game.players.length;
+  for (let k = 1; k < n; k++) {
+    const d = game.players[(p.idx + k) % n]; // APNAP
+    if (!d.alive) continue;
     const mine = combat.attacks.filter((a) => a.defender === d);
     if (!mine.length) continue;
     const atks = mine.map((a) => a.attacker);
-    const raw = d.isAI ? aiChooseBlocks(game, d, atks) : await io.chooseBlocks(game, d, atks);
+    let raw;
+    if (aiControlled(game, d)) raw = aiChooseBlocks(game, d, atks);
+    else {
+      const options = atks.map((a) => ({
+        attacker: a.iid,
+        menace: has(a, 'menace'),
+        blockers: d.battlefield.filter((b) => canBlock(game, b, a)).map((b) => b.iid),
+      }));
+      raw = new Map();
+      if (options.some((o) => o.blockers.length)) {
+        const v = await io.decide(d, { kind: 'blockers', options });
+        for (const x of Array.isArray(v) ? v : []) {
+          const a = atks.find((c) => c.iid === x.attacker);
+          const bs = (x.blockers || []).map((id) => d.battlefield.find((c) => c.iid === id)).filter(Boolean);
+          if (a && bs.length) raw.set(a, bs);
+        }
+      }
+    }
     const blocks = validateBlocks(game, raw);
     for (const a of mine) {
       a.blockers = blocks.get(a.attacker) || [];
-      a.blocked = a.blockers.length > 0; // CR 509.1h: sigue bloqueada aunque el bloqueador desaparezca
+      a.blocked = a.blockers.length > 0; // CR 509.1h
     }
     if (blocks.size) summary.push(`${d.name} bloquea ${blocks.size}`);
   }
-  if (summary.length) await io.step('BLOCKERS', summary.join(' · '));
-
-  // Daño de combate (CR 510). Paso extra de "dañar primero" si hay first/double strike (CR 510.4).
-  setStep(game, 'combatDamage');
-  const fs = (c) => has(c, 'first strike') || has(c, 'double strike');
-  const anyFirst = combat.attacks.some((a) => fs(a.attacker) || a.blockers.some(fs));
-  let total = '';
-  if (anyFirst) {
-    total = dealCombatDamage(game, combat, 'first');
-    await io.step('FIRST STRIKE', total);
+  if (summary.length) {
+    log(game, `🛡 ${summary.join(' · ')} (CR 509).`);
+    await io.step('BLOCKERS', summary.join(' · '));
   }
-  total = dealCombatDamage(game, combat, anyFirst ? 'regular' : 'only');
-  await flushTriggers(game, io);
-  await io.step('DAMAGE', total);
-  return endCombat(game, total);
-}
-
-function endCombat(game, summary) {
-  setStep(game, 'endCombat'); // CR 511
-  game.combat = null;
-  setStep(game, 'main2');
-  return summary;
 }
 
 function dealsInStage(c, stage, dealtFirst) {
@@ -1001,9 +1504,8 @@ function dealsInStage(c, stage, dealtFirst) {
 }
 
 /** Asigna y reparte el daño de combate simultáneamente (CR 510.1–510.2). */
-function dealCombatDamage(game, combat, stage) {
-  combat.dealtFirst ||= new Set();
-  const events = []; // { source, target (card|player), amount }
+export function dealCombatDamage(game, combat, stage) {
+  const events = [];
   for (const a of combat.attacks) {
     const atk = a.attacker;
     const atkP = power(game, atk);
@@ -1012,9 +1514,8 @@ function dealCombatDamage(game, combat, stage) {
       else if (a.blockers.length === 0) {
         if (has(atk, 'trample')) events.push({ source: atk, target: a.defender, amount: atkP }); // CR 702.19e
       } else {
-        // CR 510.1c-d: daño letal a cada bloqueador antes de pasar al siguiente / al jugador con arrollar
-        let left = atkP;
-        const sorted = [...a.blockers].sort((x, y) => toughness(game, x) - y.damage - (toughness(game, y) - x.damage));
+        let left = atkP; // CR 510.1c-d
+        const sorted = [...a.blockers].sort((x, y) => toughness(game, x) - x.damage - (toughness(game, y) - y.damage));
         sorted.forEach((b, i) => {
           const lethal = has(atk, 'deathtouch') ? 1 : Math.max(0, toughness(game, b) - b.damage); // CR 702.2c
           const last = i === sorted.length - 1;
@@ -1036,15 +1537,13 @@ function dealCombatDamage(game, combat, stage) {
   for (const ev of events) {
     const src = ev.source;
     const ctrl = game.players[src.owner];
-    if (ev.target.idx !== undefined && ev.target.life !== undefined) {
+    if (ev.target.life !== undefined && ev.target.library) {
       const pl = ev.target;
       if (has(src, 'infect')) pl.poison += ev.amount; // CR 702.90b
       else pl.life -= ev.amount;
-      const toxic = (src.keywords || []).find((k) => /^toxic/i.test(k));
-      if (toxic) pl.poison += parseInt((src.oracle || '').match(/Toxic (\d+)/i)?.[1] || '1', 10); // CR 702.164
+      if ((src.keywords || []).some((k) => /^toxic/i.test(k))) pl.poison += parseInt((src.oracle || '').match(/Toxic (\d+)/i)?.[1] || '1', 10); // CR 702.164
       if (src.isCommander) pl.commanderDamage[src.iid] = (pl.commanderDamage[src.iid] || 0) + ev.amount; // CR 903.10a
       toPlayers.set(pl.name, (toPlayers.get(pl.name) || 0) + ev.amount);
-      // "Whenever ~ deals combat damage to a player"
       for (const m of (src.oracle || '').matchAll(/whenever [^,]*? deals combat damage to a player, ([^.\n]+)/gi)) {
         resolveText(game, ctrl, m[1], { source: src, defender: pl });
       }
@@ -1070,21 +1569,6 @@ function aiDiscard(p, n) {
   return [...p.hand]
     .sort((a, b) => (lands >= 5 ? Number(isLand(b)) - Number(isLand(a)) : 0) || (b.cmc || 0) - (a.cmc || 0))
     .slice(0, n);
-}
-
-function aiPickResponse(game, p, ctx, options) {
-  if (ctx.type === 'spell') {
-    const c = ctx.item.card;
-    const t = (c.oracle || '').toLowerCase();
-    const wipeHurtsMe = /destroy all|exile all/.test(t) && p.battlefield.filter(isCreature).length >= 2;
-    const scary = c.isCommander || (c.cmc || 0) >= 5 || wipeHurtsMe || /extra turn/.test(t);
-    return scary ? options.find((o) => /counter target/i.test(o.oracle)) || null : null;
-  }
-  if (ctx.type === 'attack') {
-    const threat = [...ctx.attackers].sort((a, b) => threatScore(game, b) - threatScore(game, a))[0];
-    if (threat && (power(game, threat) >= 3 || threat.isCommander)) return options[0];
-  }
-  return null;
 }
 
 export function aiChooseBlocks(game, d, attackers) {
@@ -1126,81 +1610,90 @@ function aiPlanAttacks(game, p) {
       const blockers = target.battlefield.filter((b) => canBlock(game, b, a));
       return !blockers.some((b) => power(game, b) >= toughness(game, a) && toughness(game, b) > power(game, a));
     })
-    .filter((a, i, arr) => p.life > 12 || arr.length < 2 || i > 0) // con poca vida deja un defensor
+    .filter((a, i, arr) => p.life > 12 || arr.length < 2 || i > 0)
     .map((attacker) => ({ attacker, defender: target }));
 }
 
 function castScore(game, p, c) {
   const t = (c.oracle || '').toLowerCase();
   let s = c.cmc || 0;
-  if (/add \{|search your library for .*land/.test(t)) s += 6;
+  if (/add \{|search your library for .*land|create (a|one|two|\w+) treasure/.test(t)) s += 6;
   if (c.isCommander) s += 4;
   if (/destroy all|exile all|all creatures get -/.test(t)) {
     const mine = p.battlefield.filter(isCreature).length;
     const theirs = opponents(game, p).reduce((n, o) => n + o.battlefield.filter(isCreature).length, 0);
     s = theirs >= mine + 3 ? s + 5 : -100;
   }
-  if (/(destroy|exile) target/.test(t) && !bestTarget(game, p, (t.match(/(?:destroy|exile) target ([a-z ]+?)(?:\.|,| with| an)/) || [])[1] || 'creature'))
-    s = -100;
-  if (/counter target/.test(t)) s = -100; // se guarda para responder
-  if (/\bInstant\b/.test(c.typeLine) && /(destroy|exile) target creature/.test(t) && game.step === 'main1') s = -100; // reservar
+  const spec = targetSpec(c);
+  if (spec) {
+    if (spec.type === 'spell') return -100; // contrahechizos: se guardan para responder
+    const legal = legalTargets(game, p, spec);
+    if (!aiChooseTarget(game, p, spec, legal)) return -100;
+    if (isInstantSpeed(c) && spec.type !== 'player' && game.step === 'main1') return -100; // reservar removal instantáneo
+  }
+  // Evitar pagar impuestos absurdos (Rhystic Study, Thalia…) si deja sin maná para nada más
   return s;
 }
 
-async function aiMain(game, p, io) {
-  if (p.landsPlayed === 0) {
-    const lands = p.hand
-      .filter(isLand)
-      .sort((a, b) => Number(/enters.*tapped/i.test(a.oracle)) - Number(/enters.*tapped/i.test(b.oracle)));
-    if (lands[0] && playLand(game, p, lands[0]).ok) await io.step('LAND DROP', lands[0].name);
-  }
-  // Fetchlands y habilidades {T} que crean fichas / roban
-  for (const c of [...p.battlefield]) {
-    for (const ab of activatedAbilities(game, p, c)) {
-      const fx = await activate(game, p, c, ab, io);
-      if (fx.length) await io.step('ABILITY', `${c.name}: ${fx.join(', ')}`);
-      break;
+function aiWantsCounter(game, p, item) {
+  const c = item.card;
+  const t = (c.oracle || '').toLowerCase();
+  const wipeHurtsMe = /destroy all|exile all/.test(t) && p.battlefield.filter(isCreature).length >= 2;
+  const targetsMe = item.target && ((item.target.type === 'player' && item.target.idx === p.idx) ||
+    (item.target.type === 'card' && findCard(game, item.target.iid)?.card.owner === p.idx));
+  return c.isCommander || (c.cmc || 0) >= 5 || wipeHurtsMe || targetsMe || /extra turn/.test(t);
+}
+
+/** Decide una acción de prioridad para la IA (CR 117). */
+export function aiPriorityAction(game, p) {
+  const top = game.stack[game.stack.length - 1];
+  if (top) {
+    if (top.controller !== p && top.kind === 'spell' && aiWantsCounter(game, p, top)) {
+      const counter = p.hand.find((c) => {
+        const spec = targetSpec(c);
+        return spec?.type === 'spell' && counterMatches(spec.kind, top.card) && !castBlockReason(game, p, c) && canPay(game, p, c);
+      });
+      if (counter) return { type: 'cast', iid: counter.iid, target: { type: 'stack', id: top.id } };
     }
+    return PASS;
   }
-  for (let guard = 0; guard < 15 && game.winner == null && p.alive; guard++) {
-    const options = [...p.hand.filter((c) => !isLand(c)), ...p.command]
+  const myMain = game.active === p.idx && MAIN_STEPS.includes(game.step);
+  if (myMain) {
+    if (p.landsPlayed === 0) {
+      const land = p.hand.filter(isLand).sort((a, b) => Number(/enters.*tapped/i.test(a.oracle)) - Number(/enters.*tapped/i.test(b.oracle)))[0];
+      if (land) return { type: 'land', iid: land.iid };
+    }
+    if (game.step === 'main1') {
+      for (const c of p.battlefield) {
+        if (activatedAbilities(game, p, c).length) return { type: 'activate', iid: c.iid, index: 0 };
+      }
+    }
+    const best = [...p.hand.filter((c) => !isLand(c)), ...p.command]
       .filter((c) => !castBlockReason(game, p, c) && canPay(game, p, c))
       .map((c) => ({ c, score: castScore(game, p, c) }))
       .filter((o) => o.score > -50)
-      .sort((a, b) => b.score - a.score);
-    if (!options.length) break;
-    const res = await castSpell(game, p, options[0].c, io);
-    if (res.ok && res.effects?.length) await io.step(labelFor(res.effects), `${options[0].c.name} · ${res.effects.join(', ')}`);
+      .sort((a, b) => b.score - a.score)[0];
+    if (best) return { type: 'cast', iid: best.c.iid };
+    return PASS;
   }
-}
-
-function labelFor(effects) {
-  if (effects.some((e) => e.startsWith('BOARD WIPE'))) return 'BOARD WIPE';
-  if (effects.some((e) => /destruye|exilia/.test(e))) return 'REMOVAL';
-  if (effects.some((e) => e.startsWith('crea'))) return 'TOKENS';
-  if (effects.some((e) => e.startsWith('busca'))) return 'RAMP';
-  return 'RESOLVE';
-}
-
-/** Turno completo de la IA siguiendo la estructura de turno. */
-export async function aiTurn(game, io, { skipStart = false } = {}) {
-  const p = game.players[game.active];
-  if (!skipStart) await beginTurn(game, io);
-  if (!p.alive || game.winner != null) return endIfNeeded(game, io);
-  if (game.step === 'main1') await aiMain(game, p, io);
-  if (game.winner != null) return;
-  if (game.step === 'main1') {
-    const plan = aiPlanAttacks(game, p);
-    if (plan.length) await runCombat(game, p, plan, io);
-    else setStep(game, 'main2');
+  // Fuera de su fase principal: removal instantáneo contra atacantes, o hechizos al final del turno rival
+  if (game.step === 'declareAttackers' && game.combat?.attacks.some((a) => a.defender === p)) {
+    const attackers = game.combat.attacks.filter((a) => a.defender === p).map((a) => a.attacker);
+    const threat = attackers.sort((a, b) => threatScore(game, b) - threatScore(game, a))[0];
+    if (threat && (power(game, threat) >= 3 || threat.isCommander)) {
+      const removal = p.hand.find((c) => {
+        const spec = targetSpec(c);
+        return isInstantSpeed(c) && spec?.type !== 'spell' && spec?.type !== 'player' && spec &&
+          !castBlockReason(game, p, c) && canPay(game, p, c) &&
+          legalTargets(game, p, spec).some((r) => r.type === 'card' && r.iid === threat.iid) &&
+          (spec.amount == null || num(spec.amount) >= toughness(game, threat) - threat.damage);
+      });
+      if (removal) return { type: 'cast', iid: removal.iid, target: { type: 'card', iid: threat.iid } };
+    }
   }
-  if (game.winner != null) return;
-  await aiMain(game, p, io);
-  await endIfNeeded(game, io);
-}
-
-async function endIfNeeded(game, io) {
-  if (game.winner != null) return;
-  await io.step('END TURN', game.players[game.active].name);
-  await endTurn(game, io);
+  if (game.step === 'end' && game.active !== p.idx) {
+    const flashy = p.hand.find((c) => isInstantSpeed(c) && !targetSpec(c) && !castBlockReason(game, p, c) && canPay(game, p, c));
+    if (flashy) return { type: 'cast', iid: flashy.iid };
+  }
+  return PASS;
 }
