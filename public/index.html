@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#08110f">
+  <title>Quad The Gathering</title>
+  <meta name="description" content="Mesa de Commander para 2–4 jugadores: importa decks desde Archidekt, Moxfield y más, y juega o simula la partida.">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎴</text></svg>">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@600;700&family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="hero">
+    <h1>QUAD <span>THE</span> GATHERING</h1>
+    <p>Pega links de <b>Archidekt</b>, <b>Moxfield</b>, <b>Deckstats</b>, <b>TappedOut</b> o <b>MTGGoldfish</b> (o la lista en texto), analiza el pod y llévalo a la mesa de Commander.</p>
+  </header>
+  <main>
+    <section id="setup" aria-label="Preparar pod"></section>
+    <section id="table" aria-label="Mesa de Commander" hidden></section>
+  </main>
+  <footer class="foot">Datos de cartas por <a href="https://scryfall.com" target="_blank" rel="noopener">Scryfall</a>. Proyecto de fans, no afiliado a Wizards of the Coast.</footer>
+  <script type="module" src="app.js"></script>
+</body>
+</html>

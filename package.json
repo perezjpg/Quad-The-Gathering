@@ -1,0 +1,16 @@
+{
+  "name": "quad-the-gathering",
+  "version": "0.1.0",
+  "description": "Pod de 4 jugadores para Magic: The Gathering: importa decks desde Archidekt, Moxfield, Deckstats, TappedOut, MTGGoldfish o texto y compáralos.",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT"
+}
