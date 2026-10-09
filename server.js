@@ -4,12 +4,13 @@
 import http from 'node:http';
 import os from 'node:os';
 import { readFile, stat } from 'node:fs/promises';
-import { extname, join, normalize, dirname } from 'node:path';
+import { extname, join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { importDeck, finalize, SOURCES } from './src/sources.js';
 import { parseDeckText } from './public/lib/deckText.js';
 import { getCards } from './src/cards.js';
 import * as Rooms from './src/rooms.js';
+import { staticPath } from './src/staticPath.js';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), 'public');
 const PORT = Number(process.env.PORT) || 3000;
@@ -133,10 +134,8 @@ async function handleApi(req, res, url) {
 }
 
 async function handleStatic(req, res, url) {
-  let path = normalize(decodeURIComponent(url.pathname)).replace(/^(\.\.[/\\])+/, '');
-  if (path.endsWith('/')) path += 'index.html';
-  const file = join(ROOT, path);
-  if (!file.startsWith(ROOT)) {
+  const file = staticPath(ROOT, url.pathname);
+  if (!file) {
     res.writeHead(403);
     return res.end();
   }
