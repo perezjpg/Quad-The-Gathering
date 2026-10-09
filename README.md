@@ -63,6 +63,10 @@ No hace falta buscar ninguna base de datos. La app usa **[Scryfall](https://scry
 - **Objetivos** (601.2c): eliges el objetivo de tus hechizos. Si desaparece antes de resolverse, el hechizo no se resuelve (608.2b)
 - **Maná con colores** (CR 106/107.4): híbrido, pirexiano, {X}, Treasure, Command Tower, Signets
 - **Combate en pasos** (506–511): eliges a quién ataca cada criatura y declaras tus bloqueadores. Hay first/double strike, menace, trample, deathtouch, lifelink, flying/reach, infect y más
+- **Planeswalkers** (606): habilidades de lealtad +N/−N/−X una vez por turno; puedes atacarlos y el daño les quita lealtad
+- **Generadores de tokens**: hechizos, habilidades con coste de maná o sacrificio (Krenko, Goblin Bombardment, Clue), "for each", X/X, disparadores de upkeep; Chatterfang y duplicadores
+- **📊 Análisis de la partida**: lectura de mesa (mayor amenaza, carta MVP, eficiencia de maná), gráfica de vida por turno y tabla de estadísticas
+- **Mesa en cruz** para 4 jugadores, como en el video
 - **Acciones basadas en estado** (704) y **reglas de Commander** (903): impuesto, zona de mando, 21 de daño de comandante
 - **🤖 IA juega por mí**, **⏭ Pasar turno**, velocidad y pausa (anfitrión), registro con números de regla
 

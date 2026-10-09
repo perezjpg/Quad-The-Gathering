@@ -25,6 +25,7 @@ export function summarize(card) {
     oracle,
     power: card.power ?? face.power ?? null,
     toughness: card.toughness ?? face.toughness ?? null,
+    loyalty: card.loyalty ?? face.loyalty ?? null,
     keywords: card.keywords || [],
     colors: card.colors || face.colors || [],
     colorIdentity: card.color_identity || [],

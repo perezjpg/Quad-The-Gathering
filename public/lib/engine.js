@@ -39,6 +39,19 @@ const num = (s, x = 0) => (String(s).toLowerCase() === 'x' ? x : (NUM[String(s).
 const escRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 const cap = (s) => s.replace(/\b\w/g, (c) => c.toUpperCase());
 
+/** Cuenta cosas tipo "lands", "creatures", "goblins", "cards in your hand" para efectos "for each"/"equal to". */
+export function countThings(game, p, phrase) {
+  const ph = phrase.toLowerCase().trim();
+  if (/cards? in your hand/.test(ph)) return p.hand.length;
+  if (/opponents?/.test(ph)) return opponents(game, p).length;
+  const word = ph.replace(/^(other|another|nontoken|untapped|tapped) /, '').split(' ').pop().replace(/s$/, '');
+  return p.battlefield.filter((c) => {
+    if (/nontoken/.test(ph) && c.isToken) return false;
+    const tl = c.typeLine.toLowerCase();
+    return tl.includes(word) || subtypes(c).some((st) => st.toLowerCase() === word);
+  }).length;
+}
+
 export const has = (c, kw) => (c.keywords || []).some((k) => k.toLowerCase() === kw);
 export const isInstantOrSorcery = (c) => /\b(Instant|Sorcery)\b/.test(c.typeLine);
 const isInstantSpeed = (c) => /\bInstant\b/.test(c.typeLine) || has(c, 'flash');
@@ -500,6 +513,12 @@ export function targetSpec(card) {
   return null;
 }
 
+/** Objetivos que se eligen al LANZAR (CR 601.2c): solo instantáneos y conjuros. Los permanentes
+ *  eligen objetivos en sus habilidades (CR 602.2b) o al dispararse su efecto al entrar (CR 603.3d). */
+export function spellTargetSpec(card) {
+  return isInstantOrSorcery(card) ? targetSpec(card) : null;
+}
+
 const targetableBy = (c, p) => !has(c, 'shroud') && !(has(c, 'hexproof') && c.owner !== p.idx); // CR 702.11b, 702.18
 
 function permFilter(kind) {
@@ -615,7 +634,7 @@ export async function castSpell(game, p, card, io, { x = 0, target } = {}) {
   if (why) return { ok: false, reason: why };
 
   // CR 601.2c: objetivos
-  const spec = targetSpec(card);
+  const spec = spellTargetSpec(card);
   let chosen = null;
   if (spec) {
     const legal = legalTargets(game, p, spec);
@@ -658,28 +677,176 @@ function targetLabel(game, ref) {
   return ` → ${t.item.card.name}`;
 }
 
-/** Habilidades activadas no de maná que el motor sabe resolver (CR 602). */
-export function activatedAbilities(game, p, c) {
-  const out = [];
-  if (c.tapped || (isCreature(c) && c.sick && !has(c, 'haste'))) return out;
-  const text = c.oracle || '';
-  let m = text.match(/\{T\}, (?:Pay 1 life, )?Sacrifice [^:]+: (Search your library for [^.]+\.[^.]*\.?)/);
-  if (m) out.push({ label: 'Buscar tierra (sacrificar)', sacrifice: true, life: /Pay 1 life/.test(m[0]) ? 1 : 0, text: m[1] });
-  for (const mm of text.matchAll(/(?:^|\n)\{T\}: ((?:Create|Draw|Target player|Each opponent|[^.\n]* deals \d+ damage)[^\n]*)/g)) {
-    out.push({ label: mm[1].slice(0, 60), text: mm[1] });
+// ---------- Habilidades activadas (CR 602) y de lealtad (CR 606) ----------
+
+// Efectos que el motor sabe resolver; las habilidades con otros efectos no se ofrecen.
+const RESOLVABLE = /\b(create|draw|deals? \d+|deals? x|destroy target|exile target|gain \d+ life|loses? \d+ life|put (?:a|two|three|\d+) \+1\/\+1 counter|search your library for)/i;
+
+/** Separa "COSTE: EFECTO" y convierte el coste en una estructura (CR 602.1, 118). */
+function parseActivatedLine(line, card) {
+  const i = line.indexOf(': ');
+  if (i < 0) return null;
+  const costText = line.slice(0, i);
+  const effect = line.slice(i + 2).replace(/\s*\([^)]*\)\s*$/, '');
+  if (/\bAdd \{/.test(effect) || !RESOLVABLE.test(effect)) return null; // las de maná se manejan aparte
+  const cost = { mana: null, tap: false, life: 0, sacSelf: false, sacOther: null, discard: 0 };
+  for (const raw of costText.split(/, /)) {
+    const part = raw.trim();
+    if (part === '{T}') cost.tap = true;
+    else if (/^(\{[^}]+\})+$/.test(part) && !/\{[TQ]\}/.test(part)) cost.mana = parseCost(part);
+    else if (/^Pay (\d+) life$/i.test(part)) cost.life = +part.match(/\d+/)[0];
+    else if (/^Sacrifice (this (artifact|creature|token|enchantment|permanent|land)|~)$/i.test(part) || part === `Sacrifice ${card.name}`) cost.sacSelf = true;
+    else if (/^Sacrifice (a|an|another) ([a-z ]+)$/i.test(part)) {
+      const m = part.match(/^Sacrifice (a|an|another) ([a-z ]+)$/i);
+      cost.sacOther = { another: m[1].toLowerCase() === 'another', type: m[2].toLowerCase() };
+    } else if (/^Discard a card$/i.test(part)) cost.discard = 1;
+    else return null; // coste que el motor no soporta (exiliar del cementerio, quitar contadores…)
   }
-  return out;
+  const sorcery = /activate only as a sorcery/i.test(effect);
+  const once = /activate only once each turn/i.test(effect);
+  const text = effect.replace(/\s*Activate only (?:as a sorcery|once each turn)[^.]*\./gi, '').trim();
+  return { kind: 'activated', cost, text, sorcery, once };
 }
 
-export async function activateAbility(game, p, c, index, io) {
-  const ability = activatedAbilities(game, p, c)[index];
-  if (!ability) return { ok: false, reason: 'Habilidad no disponible.' };
-  c.tapped = true; // CR 602.2: pagar costes
-  if (ability.life) p.life -= ability.life;
-  if (ability.sacrifice) moveCard(game, c, 'graveyard');
-  game.stack.push({ id: ++stackSeq, kind: 'ability', card: { ...c, name: `${c.name} (habilidad)` }, source: c, controller: p, text: ability.text });
-  log(game, `⚙ ${p.name} activa ${c.name}.`);
-  await io.step('ABILITY', c.name);
+/** Lista de habilidades activables de un permanente, con la razón si ahora no se puede (o null). */
+export function activatedAbilities(game, p, c) {
+  const out = [];
+  const lines = (c.oracle || '').split('\n').map((l) => l.trim()).filter(Boolean);
+  lines.forEach((line, li) => {
+    // CR 606: habilidades de lealtad "+1: …", "−2: …", "0: …", "−X: …"
+    const lm = line.match(/^([+−-])?(\d+|X): (.+)$/);
+    if (lm && isPlaneswalker(c)) {
+      const sign = lm[1] === '+' ? 1 : lm[1] ? -1 : 0;
+      const isX = lm[2] === 'X';
+      const n = isX ? 0 : +lm[2];
+      out.push({ kind: 'loyalty', key: `L${li}`, loyalty: sign * n, isX, text: lm[3], label: `${lm[1] === '+' ? '+' : lm[1] ? '−' : ''}${lm[2]}: ${lm[3]}`.slice(0, 70) });
+      return;
+    }
+    const ab = parseActivatedLine(line, c);
+    if (ab) out.push({ ...ab, key: `A${li}`, label: line.slice(0, 70) });
+  });
+  return out.map((ab, index) => ({ ...ab, index, reason: abilityBlockReason(game, p, c, ab) }));
+}
+
+function abilityBlockReason(game, p, c, ab) {
+  if (!p.battlefield.includes(c)) return 'El permanente no está en el campo.';
+  const used = (c.usedAbilities || {})[ab.key] === game.turnId;
+  if (ab.kind === 'loyalty') {
+    if (!sorcerySpeedOK(game, p)) return 'Lealtad: solo en tu fase principal con la pila vacía (CR 606.3).';
+    if (c.loyaltyUsedTurn === game.turnId) return 'Ya activaste una habilidad de lealtad de este planeswalker este turno (CR 606.3).';
+    if (ab.loyalty < 0 && c.counters.loyalty < -ab.loyalty) return 'No tiene suficientes contadores de lealtad (CR 606.6).';
+    return null;
+  }
+  const cost = ab.cost;
+  if (ab.sorcery && !sorcerySpeedOK(game, p)) return 'Solo a velocidad de conjuro (CR 602.5d).';
+  if (ab.once && used) return 'Solo una vez por turno.';
+  if (cost.tap && c.tapped) return 'Está girado.';
+  if (cost.tap && isCreature(c) && c.sick && !has(c, 'haste')) return 'Mareo de invocación: no puede usar {T} (CR 302.6).';
+  if (cost.life && p.life < cost.life) return 'No tienes vida suficiente para pagar (CR 119.4).';
+  if (cost.discard && p.hand.length < cost.discard) return 'No tienes cartas para descartar.';
+  if (cost.sacOther && !sacCandidates(p, c, cost.sacOther).length) return `No tienes ${cost.sacOther.type} para sacrificar.`;
+  if (cost.mana && !planPayment(sourcesOf(p).filter((s) => !(cost.tap && s.card === c)), game.pools[p.idx], cost.mana, { life: p.life }).ok)
+    return 'Maná insuficiente.';
+  const spec = targetSpec({ oracle: ab.text });
+  if (spec && !legalTargets(game, p, spec).length) return 'No hay objetivos legales (CR 602.2b).';
+  return null;
+}
+
+function sacCandidates(p, src, { another, type }) {
+  const t = type.replace(/s$/, '');
+  return p.battlefield.filter((c) => {
+    if (another && c === src) return false;
+    const tl = c.typeLine.toLowerCase();
+    if (t === 'permanent') return true;
+    if (t === 'nonland permanent') return !isLand(c);
+    return tl.includes(t) || subtypes(c).some((s) => s.toLowerCase() === t);
+  });
+}
+
+/**
+ * Activa una habilidad (CR 602.2): anunciar, elegir objetivos/X, pagar costes y ponerla en la pila.
+ * Las de lealtad (CR 606) pagan su coste poniendo o quitando contadores de lealtad.
+ */
+export async function activateAbility(game, p, c, index, io, { target, x } = {}) {
+  const ab = activatedAbilities(game, p, c)[index];
+  if (!ab) return { ok: false, reason: 'Habilidad no disponible.' };
+  if (ab.reason) return { ok: false, reason: ab.reason };
+  const ai = aiControlled(game, p);
+
+  // X de lealtad (−X)
+  let X = 0;
+  if (ab.kind === 'loyalty' && ab.isX) {
+    X = ai ? Math.max(1, Math.floor(c.counters.loyalty / 2)) : Math.min(c.counters.loyalty, Math.max(0, x | 0));
+  }
+
+  // Objetivos (CR 602.2b → 601.2c)
+  const spec = targetSpec({ oracle: ab.text });
+  let chosen = null;
+  if (spec) {
+    const legal = legalTargets(game, p, spec);
+    if (!legal.length) return { ok: false, reason: 'No hay objetivos legales.' };
+    if (target && legal.some((r) => sameTarget(r, target))) chosen = target;
+    else if (ai) chosen = aiChooseTarget(game, p, spec, legal);
+    else {
+      chosen = await io.decide(p, { kind: 'target', card: `${c.name}: ${ab.label}`, iid: c.iid, spec, targets: legal });
+      if (!chosen || !legal.some((r) => sameTarget(r, chosen))) return { ok: false, reason: 'Activación cancelada.' };
+    }
+    if (!chosen) return { ok: false, reason: 'No hay objetivos adecuados.' };
+  }
+
+  // Pagar costes (CR 602.2h / 606.4)
+  if (ab.kind === 'loyalty') {
+    c.counters.loyalty += ab.isX ? -X : ab.loyalty;
+    c.loyaltyUsedTurn = game.turnId;
+  } else {
+    const cost = ab.cost;
+    if (cost.sacOther) {
+      const cands = sacCandidates(p, c, cost.sacOther);
+      let victim = null;
+      if (!ai) {
+        const id = await io.decide(p, { kind: 'target', card: `Sacrificar (${c.name})`, iid: c.iid, spec: { type: 'sacrifice' }, targets: cands.map((x2) => ({ type: 'card', iid: x2.iid })) });
+        victim = cands.find((x2) => x2.iid === id?.iid);
+        if (!victim) return { ok: false, reason: 'Activación cancelada.' };
+      } else victim = [...cands].sort((a, b) => Number(!!b.isToken) - Number(!!a.isToken) || threatScore(game, a) - threatScore(game, b))[0];
+      cost.victim = victim;
+    }
+    if (cost.mana) {
+      const wasTapped = c.tapped;
+      if (cost.tap) c.tapped = true; // la propia fuente no paga su maná si se gira como coste
+      const ok = payCost(game, p, cost.mana, 0);
+      if (!ok) {
+        c.tapped = wasTapped;
+        return { ok: false, reason: 'Maná insuficiente.' };
+      }
+    }
+    if (cost.tap) c.tapped = true;
+    if (cost.life) p.life -= cost.life;
+    if (cost.discard) {
+      const card = aiDiscard(p, 1)[0];
+      if (card) moveCard(game, card, 'graveyard');
+    }
+    if (cost.victim) {
+      moveCard(game, cost.victim, 'graveyard');
+      log(game, `   🔥 ${p.name} sacrifica ${cost.victim.name}.`);
+    }
+    if (cost.sacSelf) moveCard(game, c, 'graveyard');
+    c.usedAbilities = { ...(c.usedAbilities || {}), [ab.key]: game.turnId };
+  }
+
+  game.stack.push({
+    id: ++stackSeq,
+    kind: 'ability',
+    card: { ...c, name: `${c.name}${ab.kind === 'loyalty' ? ` (${ab.label.split(':')[0]})` : ' (habilidad)'}` },
+    source: c,
+    controller: p,
+    text: ab.text,
+    x: X,
+    target: chosen,
+    spec,
+  });
+  log(game, `⚙ ${p.name} activa ${c.name}: ${ab.label}${targetLabel(game, chosen)}.`);
+  await io.step(ab.kind === 'loyalty' ? 'PLANESWALKER' : 'ABILITY', `${c.name}: ${ab.label}`);
+  await flushTriggers(game, io);
   return { ok: true };
 }
 
@@ -755,7 +922,7 @@ async function resolveTop(game, io) {
   game.stack.pop();
   let effects = [];
   if (item.kind === 'ability') {
-    effects = resolveText(game, p, item.text, { source: item.source, target: item.target });
+    effects = resolveText(game, p, item.text, { source: item.source, target: item.target, x: item.x || 0 });
   } else if (isInstantOrSorcery(card)) {
     effects = resolveText(game, p, card.oracle || '', { source: card, x: item.x, target: item.target });
     if (!card.isToken) game.players[card.owner].graveyard.push(card); // CR 608.2n
@@ -768,7 +935,22 @@ async function resolveTop(game, io) {
       .filter((l) => /^when(ever)? .* enters/i.test(l))
       .map((l) => l.replace(/^when(ever)? [^,]* enters[^,]*, /i, ''))
       .join('\n');
-    if (etb) effects = resolveText(game, p, etb, { source: card, x: item.x });
+    if (etb) {
+      // CR 603.3d: los objetivos del disparador al entrar se eligen al ponerlo en la pila
+      const spec = targetSpec({ oracle: etb });
+      let target = null;
+      if (spec) {
+        const legal = legalTargets(game, p, spec);
+        if (legal.length) {
+          if (aiControlled(game, p)) target = aiChooseTarget(game, p, spec, legal);
+          else {
+            target = await io.decide(p, { kind: 'target', card: `${card.name} (al entrar)`, iid: card.iid, spec, targets: legal });
+            if (!legal.some((r) => sameTarget(r, target))) target = null;
+          }
+        }
+      }
+      if (!spec || target) effects = resolveText(game, p, etb, { source: card, x: item.x, target });
+    }
   }
   runSBA(game);
   log(game, `   ↳ Se resuelve ${card.name}${effects.length ? ': ' + effects.join(', ') : ''}.`);
@@ -777,8 +959,8 @@ async function resolveTop(game, io) {
 }
 
 function stillLegal(game, item) {
-  const spec = item.kind === 'spell' ? targetSpec(item.card) : null;
-  if (!spec) return true;
+  const spec = item.spec || (item.kind === 'spell' ? spellTargetSpec(item.card) : null);
+  if (!spec || spec.type === 'sacrifice') return true;
   return legalTargets(game, item.controller, spec).some((r) => sameTarget(r, item.target));
 }
 
@@ -899,6 +1081,10 @@ export function resolveText(game, p, text, { source = null, x = 0, target = null
     const n = num(m[1], x);
     draw(game, p, n);
     out.push(`roba ${n}`);
+  } else if ((m = t.match(/draws? cards equal to (?:the greatest power among creatures you control|the number of ([a-z ]+?)(?: you control)?)(?:[.,]|$)/))) {
+    const n = m[1] ? countThings(game, p, m[1]) : Math.max(0, ...p.battlefield.filter(isCreature).map((c) => power(game, c)));
+    draw(game, p, n);
+    out.push(`roba ${n}`);
   }
 
   // Buscar tierras (Cultivate, Rampant Growth, fetchlands…)
@@ -928,14 +1114,20 @@ export function resolveText(game, p, text, { source = null, x = 0, target = null
   }
 
   // Tokens de criatura (CR 111)
-  if ((m = t.match(/create (a|one|two|three|four|five|x|\d+) (tapped )?(\d+)\/(\d+) ([a-z ]*?)creature tokens?(?: with ([a-z ,]+?))?(?:[.,]|$| where| for| and)/))) {
-    let n = num(m[1], x);
-    const wm = t.match(/where x is the number of ([a-z]+?)s? you control/);
-    if (m[1] === 'x' && wm) n = p.battlefield.filter((c) => c.typeLine.toLowerCase().includes(wm[1])).length;
+  if ((m = t.match(/create (a number of|a|an|one|two|three|four|five|x|\d+) (tapped )?(\d+|x)\/(\d+|x) ([a-z ]*?)creature tokens?(?: with ([a-z ,]+?))?(?:[.,]|$| where| for| and| equal)/))) {
+    const wm = t.match(/where x is (?:the number of|equal to the number of) ([a-z ]+?)(?: you control|$|[.,])/);
+    const xv = wm ? countThings(game, p, wm[1]) : x;
+    let n = m[1] === 'a number of' ? 0 : m[1] === 'an' ? 1 : num(m[1], xv);
+    const eq = t.match(/tokens? equal to (?:the number of )?([a-z ]+?)(?: you control)?(?:[.,]|$)/);
+    if (m[1] === 'a number of' && eq) n = countThings(game, p, eq[1]);
+    const fe = t.match(/creature tokens? for each ([a-z ]+?)(?: you control| on the battlefield)?(?:[.,]|$)/);
+    if (fe) n *= countThings(game, p, fe[1]);
+    const pw = m[3] === 'x' ? xv : +m[3];
+    const tg = m[4] === 'x' ? xv : +m[4];
     const sub = m[5].replace(/\b(white|blue|black|red|green|colorless|and|artifact)\b/g, '').trim().split(' ').map(cap).join(' ');
     const kws = (m[6] || '').split(/,| and /).map((s) => s.trim()).filter(Boolean);
-    const made = createTokens(game, p, n, +m[3], +m[4], sub, kws, !!m[2]);
-    out.push(`crea ${made} token${made !== 1 ? 's' : ''} ${m[3]}/${m[4]}`);
+    const made = createTokens(game, p, n, pw, tg, sub, kws, !!m[2]);
+    out.push(`crea ${made} token${made !== 1 ? 's' : ''} ${pw}/${tg}`);
   }
   // Tokens de artefacto (Treasure, Clue, Food)
   if ((m = t.match(/create (a|one|two|three|four|x|\d+) (tapped )?(treasure|clue|food) tokens?/))) {
@@ -1156,10 +1348,10 @@ export function eliminate(game, p, reason) {
 export function instantOptions(game, p) {
   const spells = [...p.hand, ...p.command].filter((c) => {
     if (!isInstantSpeed(c) || isLand(c) || castBlockReason(game, p, c) || !canPay(game, p, c)) return false;
-    const spec = targetSpec(c);
+    const spec = spellTargetSpec(c);
     return !spec || legalTargets(game, p, spec).length > 0;
   });
-  const abilities = p.battlefield.filter((c) => activatedAbilities(game, p, c).length);
+  const abilities = p.battlefield.filter((c) => activatedAbilities(game, p, c).some((a) => !a.reason));
   return spells.length + abilities.length;
 }
 
@@ -1211,7 +1403,7 @@ async function performAction(game, p, act, io) {
   }
   if (act.type === 'activate') {
     const c = find(['battlefield']);
-    return c ? activateAbility(game, p, c, act.index || 0, io) : { ok: false, reason: 'Permanente no encontrado.' };
+    return c ? activateAbility(game, p, c, act.index || 0, io, { target: act.target, x: act.x }) : { ok: false, reason: 'Permanente no encontrado.' };
   }
   return { ok: false, reason: 'Acción desconocida.' };
 }
@@ -1287,6 +1479,7 @@ export async function takeTurn(game, io) {
   // 503 Upkeep
   setStep(game, 'upkeep');
   fireTriggers(game, p, /at the beginning of your upkeep, ([^.\n]+)/gi);
+  for (const pl of game.players) if (pl.alive) fireTriggers(game, pl, /at the beginning of each upkeep, ([^.\n]+)/gi);
   await io.step('UNTAP · UPKEEP', p.name);
   await flushTriggers(game, io);
   await priorityLoop(game, io);
@@ -1320,6 +1513,7 @@ export async function takeTurn(game, io) {
   // 513 End
   setStep(game, 'end');
   fireTriggers(game, p, /at the beginning of your end step, ([^.\n]+)/gi);
+  for (const pl of game.players) if (pl.alive) fireTriggers(game, pl, /at the beginning of each end step, ([^.\n]+)/gi);
   await flushTriggers(game, io);
   await io.step('END STEP', p.name);
   await priorityLoop(game, io);
@@ -1397,6 +1591,10 @@ export function validateBlocks(game, blocks) {
   return clean;
 }
 
+function defender_has_pw(player, pw) {
+  return player.battlefield.includes(pw) && isPlaneswalker(pw);
+}
+
 class Combat {
   constructor(attacker) {
     this.attackingPlayer = attacker;
@@ -1411,15 +1609,18 @@ class Combat {
 
 /** Declara el ataque a partir de un plan. Exportada para tests y para la UI manual. */
 export async function declareAttack(game, p, plan, io) {
-  const legal = plan.filter(({ attacker, defender }) => attacker && defender && canAttack(game, attacker) && defender.alive && defender !== p);
+  // CR 506.3 / 508.1b: se ataca a un jugador o a un planeswalker que él controla
+  const legal = plan
+    .filter(({ attacker, defender }) => attacker && defender && canAttack(game, attacker) && defender.alive && defender !== p)
+    .map((a) => ({ ...a, pw: a.pw && defender_has_pw(a.defender, a.pw) ? a.pw : null }));
   if (!legal.length) return false;
   const combat = new Combat(p);
   game.combat = combat;
-  for (const { attacker, defender } of legal) {
+  for (const { attacker, defender, pw } of legal) {
     if (!has(attacker, 'vigilance')) attacker.tapped = true; // CR 508.1f
-    combat.attacks.push({ attacker, defender, blockers: [], blocked: false });
+    combat.attacks.push({ attacker, defender, pw, blockers: [], blocked: false });
   }
-  const targets = [...new Set(legal.map((a) => a.defender.name))].join(', ');
+  const targets = [...new Set(legal.map((a) => (a.pw ? `${a.pw.name} (${a.defender.name})` : a.defender.name)))].join(', ');
   log(game, `⚔️ ${p.name} ataca con ${legal.length} criatura${legal.length > 1 ? 's' : ''} → ${targets} (CR 508).`);
   for (const a of combat.attacks) {
     const nm = escRe(a.attacker.name);
@@ -1452,10 +1653,12 @@ export async function combatPhase(game, p, io) {
         kind: 'attackers',
         attackers: eligible.map((c) => c.iid),
         defenders: opponents(game, p).map((o) => o.idx),
+        planeswalkers: opponents(game, p).flatMap((o) => o.battlefield.filter(isPlaneswalker).map((w) => w.iid)),
       });
       plan = (Array.isArray(v) ? v : []).map((x) => ({
         attacker: eligible.find((c) => c.iid === x.attacker),
         defender: game.players[x.defender],
+        pw: x.pw ? findCard(game, x.pw)?.card : null,
       }));
     }
   }
@@ -1558,10 +1761,12 @@ export function dealCombatDamage(game, combat, stage) {
   for (const a of combat.attacks) {
     const atk = a.attacker;
     const atkP = power(game, atk);
-    if (dealsInStage(atk, stage, combat.dealtFirst) && atkP > 0) {
-      if (!a.blocked) events.push({ source: atk, target: a.defender, amount: atkP });
+    // Si el planeswalker atacado ya no está, la criatura no hace daño de combate (CR 506.4)
+    const dest = a.pw ? (a.defender.battlefield.includes(a.pw) ? a.pw : null) : a.defender;
+    if (dealsInStage(atk, stage, combat.dealtFirst) && atkP > 0 && dest) {
+      if (!a.blocked) events.push({ source: atk, target: dest, amount: atkP });
       else if (a.blockers.length === 0) {
-        if (has(atk, 'trample')) events.push({ source: atk, target: a.defender, amount: atkP }); // CR 702.19e
+        if (has(atk, 'trample')) events.push({ source: atk, target: dest, amount: atkP }); // CR 702.19e
       } else {
         let left = atkP; // CR 510.1c-d
         const sorted = [...a.blockers].sort((x, y) => toughness(game, x) - x.damage - (toughness(game, y) - y.damage));
@@ -1572,7 +1777,7 @@ export function dealCombatDamage(game, combat, stage) {
           if (amt > 0) events.push({ source: atk, target: b, amount: amt });
           left -= amt;
         });
-        if (left > 0 && has(atk, 'trample')) events.push({ source: atk, target: a.defender, amount: left });
+        if (left > 0 && has(atk, 'trample')) events.push({ source: atk, target: dest, amount: left });
       }
       if (stage === 'first') combat.dealtFirst.add(atk);
     }
@@ -1599,7 +1804,10 @@ export function dealCombatDamage(game, combat, stage) {
       }
     } else {
       const c = ev.target;
-      if (has(src, 'infect') || has(src, 'wither')) c.counters.m1 += ev.amount; // CR 702.80, 702.90c
+      if (isPlaneswalker(c)) {
+        c.counters.loyalty -= ev.amount; // CR 120.3c: el daño a un planeswalker quita lealtad
+        toPlayers.set(`${c.name}`, (toPlayers.get(`${c.name}`) || 0) + ev.amount);
+      } else if (has(src, 'infect') || has(src, 'wither')) c.counters.m1 += ev.amount; // CR 702.80, 702.90c
       else c.damage += ev.amount;
       if (has(src, 'deathtouch')) c.deathtouched = true; // CR 702.2b
     }
@@ -1664,7 +1872,19 @@ function aiPlanAttacks(game, p) {
       return !blockers.some((b) => power(game, b) >= toughness(game, a) && toughness(game, b) > power(game, a));
     })
     .filter((a, i, arr) => p.life > 12 || arr.length < 2 || i > 0)
-    .map((attacker) => ({ attacker, defender: target }));
+    .map((attacker) => ({ attacker, defender: target, pw: null }))
+    .map((plan, _i, all) => {
+      // Mandar las criaturas justas para eliminar planeswalkers rivales (salvo que haya letal al jugador)
+      if (lethal) return plan;
+      for (const w of target.battlefield.filter(isPlaneswalker)) {
+        const assigned = all.filter((x) => x.pw === w).reduce((n, x) => n + power(game, x.attacker), 0);
+        if (assigned < w.counters.loyalty) {
+          plan.pw = w;
+          break;
+        }
+      }
+      return plan;
+    });
 }
 
 function castScore(game, p, c) {
@@ -1677,7 +1897,7 @@ function castScore(game, p, c) {
     const theirs = opponents(game, p).reduce((n, o) => n + o.battlefield.filter(isCreature).length, 0);
     s = theirs >= mine + 3 ? s + 5 : -100;
   }
-  const spec = targetSpec(c);
+  const spec = spellTargetSpec(c);
   if (spec) {
     if (spec.type === 'spell') return -100; // contrahechizos: se guardan para responder
     const legal = legalTargets(game, p, spec);
@@ -1686,6 +1906,36 @@ function castScore(game, p, c) {
   }
   // Evitar pagar impuestos absurdos (Rhystic Study, Thalia…) si deja sin maná para nada más
   return s;
+}
+
+/** IA: planeswalkers primero (CR 606), luego habilidades gratis de {T}; con maná sobrante en main 2. */
+function aiPickAbility(game, p) {
+  for (const c of p.battlefield) {
+    const abs = activatedAbilities(game, p, c).filter((a) => !a.reason);
+    if (!abs.length) continue;
+    const loyal = abs.filter((a) => a.kind === 'loyalty');
+    if (loyal.length) {
+      // Ultimate o removal si quedan contadores; si no, la mejor habilidad "+"
+      const minus = loyal
+        .filter((a) => a.loyalty < 0 && c.counters.loyalty + a.loyalty > 0)
+        .filter((a) => {
+          const spec = targetSpec({ oracle: a.text });
+          return !spec || aiChooseTarget(game, p, spec, legalTargets(game, p, spec));
+        })
+        .sort((a, b) => a.loyalty - b.loyalty)[0];
+      const plus = loyal.filter((a) => a.loyalty >= 0).sort((a, b) => b.loyalty - a.loyalty)[0];
+      const useMinus = minus && (c.counters.loyalty + minus.loyalty >= 2 || !plus);
+      const ab = useMinus ? minus : plus || minus;
+      if (ab) return { type: 'activate', iid: c.iid, index: ab.index, ability: ab };
+    }
+    const free = abs.find((a) => a.kind === 'activated' && !a.cost.mana && !a.cost.sacOther && !a.cost.discard && (!a.cost.sacSelf || /search your library/i.test(a.text)));
+    if (free) return { type: 'activate', iid: c.iid, index: free.index, ability: free };
+    if (game.step === 'main2') {
+      const paid = abs.find((a) => a.kind === 'activated' && a.cost.mana && !a.cost.sacOther && !a.cost.discard);
+      if (paid) return { type: 'activate', iid: c.iid, index: paid.index, ability: paid };
+    }
+  }
+  return null;
 }
 
 function aiWantsCounter(game, p, item) {
@@ -1703,7 +1953,7 @@ export function aiPriorityAction(game, p) {
   if (top) {
     if (top.controller !== p && top.kind === 'spell' && aiWantsCounter(game, p, top)) {
       const counter = p.hand.find((c) => {
-        const spec = targetSpec(c);
+        const spec = spellTargetSpec(c);
         return spec?.type === 'spell' && counterMatches(spec.kind, top.card) && !castBlockReason(game, p, c) && canPay(game, p, c);
       });
       if (counter) return { type: 'cast', iid: counter.iid, target: { type: 'stack', id: top.id } };
@@ -1716,17 +1966,16 @@ export function aiPriorityAction(game, p) {
       const land = p.hand.filter(isLand).sort((a, b) => Number(/enters.*tapped/i.test(a.oracle)) - Number(/enters.*tapped/i.test(b.oracle)))[0];
       if (land) return { type: 'land', iid: land.iid };
     }
-    if (game.step === 'main1') {
-      for (const c of p.battlefield) {
-        if (activatedAbilities(game, p, c).length) return { type: 'activate', iid: c.iid, index: 0 };
-      }
-    }
+    const pick = aiPickAbility(game, p);
+    // Habilidades gratis y de lealtad van primero; las que cuestan maná esperan a que no queden hechizos útiles
+    if (pick && (pick.ability.kind === 'loyalty' || !pick.ability.cost.mana)) return pick;
     const best = [...p.hand.filter((c) => !isLand(c)), ...p.command]
       .filter((c) => !castBlockReason(game, p, c) && canPay(game, p, c))
       .map((c) => ({ c, score: castScore(game, p, c) }))
       .filter((o) => o.score > -50)
       .sort((a, b) => b.score - a.score)[0];
     if (best) return { type: 'cast', iid: best.c.iid };
+    if (pick) return pick; // maná sobrante en main 2
     return PASS;
   }
   // Fuera de su fase principal: removal instantáneo contra atacantes, o hechizos al final del turno rival
@@ -1735,7 +1984,7 @@ export function aiPriorityAction(game, p) {
     const threat = attackers.sort((a, b) => threatScore(game, b) - threatScore(game, a))[0];
     if (threat && (power(game, threat) >= 3 || threat.isCommander)) {
       const removal = p.hand.find((c) => {
-        const spec = targetSpec(c);
+        const spec = spellTargetSpec(c);
         return isInstantSpeed(c) && spec?.type !== 'spell' && spec?.type !== 'player' && spec &&
           !castBlockReason(game, p, c) && canPay(game, p, c) &&
           legalTargets(game, p, spec).some((r) => r.type === 'card' && r.iid === threat.iid) &&
@@ -1745,7 +1994,7 @@ export function aiPriorityAction(game, p) {
     }
   }
   if (game.step === 'end' && game.active !== p.idx) {
-    const flashy = p.hand.find((c) => isInstantSpeed(c) && !targetSpec(c) && !castBlockReason(game, p, c) && canPay(game, p, c));
+    const flashy = p.hand.find((c) => isInstantSpeed(c) && !spellTargetSpec(c) && !castBlockReason(game, p, c) && canPay(game, p, c));
     if (flashy) return { type: 'cast', iid: flashy.iid };
   }
   return PASS;

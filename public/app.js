@@ -859,7 +859,9 @@ function decisionHTML(d) {
           .map(
             (c) => `<label class="atk"><input type="checkbox" value="${c.iid}">${cardHTML(c, { small: true })}
               <span>${esc(c.name)} ${c.power}/${c.toughness}<br><small>${esc(c.keywords.join(', '))}</small></span>
-              <select data-t="${c.iid}">${d.defenders.map((o, k) => `<option value="${o.idx}" ${k === 0 ? 'selected' : ''}>${esc(o.name)} (${o.life}❤)</option>`).join('')}</select></label>`
+              <select data-t="${c.iid}">${d.defenders.map((o, k) => `<option value="p:${o.idx}" ${k === 0 ? 'selected' : ''}>${esc(o.name)} (${o.life}❤)</option>`).join('')}${(d.planeswalkers || [])
+                .map((w) => `<option value="w:${w.iid}:${w.controller}">◆ ${esc(w.name)} (${w.loyalty} lealtad)</option>`)
+                .join('')}</select></label>`
           )
           .join('')}</div>
         <div class="row-btns"><button class="btn ghost" data-all>Todas</button><button class="btn ghost" data-none>No atacar</button><button class="btn primary" data-ok>Atacar</button></div>`;
@@ -905,7 +907,12 @@ function bindDecision(wrap, d) {
     on('[data-all]', () => wrap.querySelectorAll('.atk input').forEach((i) => (i.checked = true)));
     on('[data-none]', () => answer([]));
     on('[data-ok]', () =>
-      answer([...wrap.querySelectorAll('.atk input:checked')].map((i) => ({ attacker: +i.value, defender: +wrap.querySelector(`select[data-t="${i.value}"]`).value })))
+      answer(
+        [...wrap.querySelectorAll('.atk input:checked')].map((i) => {
+          const [kind, a, b] = wrap.querySelector(`select[data-t="${i.value}"]`).value.split(':');
+          return kind === 'w' ? { attacker: +i.value, defender: +b, pw: +a } : { attacker: +i.value, defender: +a };
+        })
+      )
     );
   }
   if (d.kind === 'blockers') {
@@ -1014,7 +1021,18 @@ function cardMenu(el) {
     }
   }
   if (mine && zone === 'battlefield') {
-    for (const ab of card.abilities || []) items.push({ label: `⚙ ${esc(ab.label)}`, disabled: !prio, run: act({ type: 'activate', iid: card.iid, index: ab.index }) });
+    for (const ab of card.abilities || []) {
+      items.push({
+        label: `${ab.kind === 'loyalty' ? '◆' : '⚙'} ${esc(ab.label)}`,
+        disabled: !prio || !!ab.reason,
+        run: () => {
+          let x = 0;
+          if (ab.isX) x = Math.max(0, parseInt(prompt('Valor de X:', '1') || '0', 10) || 0);
+          answer({ type: 'activate', iid: card.iid, index: ab.index, x });
+        },
+      });
+      if (ab.reason && prio) items.push({ note: `⚠ ${esc(ab.reason)}` });
+    }
   }
   if (mine && (zone === 'battlefield' || zone === 'hand')) {
     if (items.length) items.push({ sep: true });

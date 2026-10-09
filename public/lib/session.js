@@ -161,7 +161,9 @@ export class GameSession {
           : null,
         battlefield: p.battlefield.map((c) => ({
           ...cv(c, 'battlefield'),
-          abilities: p.idx === viewer ? E.activatedAbilities(g, p, c).map((a, i) => ({ index: i, label: a.label })) : [],
+          abilities: p.idx === viewer
+            ? E.activatedAbilities(g, p, c).map((a) => ({ index: a.index, label: a.label, reason: a.reason, kind: a.kind, isX: !!a.isX }))
+            : [],
         })),
         graveyard: p.graveyard.map((c) => cv(c, 'graveyard')),
         exile: p.exile.map((c) => cv(c, 'exile')),
@@ -193,7 +195,7 @@ export class GameSession {
         target: targetName(g, it.target),
       })),
       combat: g.combat
-        ? g.combat.attacks.map((a) => ({ attacker: a.attacker.iid, defender: a.defender.idx, blockers: a.blockers.map((b) => b.iid) }))
+        ? g.combat.attacks.map((a) => ({ attacker: a.attacker.iid, defender: a.defender.idx, pw: a.pw?.iid ?? null, blockers: a.blockers.map((b) => b.iid) }))
         : [],
       players,
       effects: me ? E.activeEffects(g, me) : [],
@@ -236,7 +238,7 @@ function playInfo(g, p, c) {
   if (isLand(c)) return { land: true, reason: E.landBlockReason(g, p, c) };
   const cost = E.costOf(g, p, c);
   const mods = E.costModifiers(g, p, c);
-  const spec = E.targetSpec(c);
+  const spec = E.spellTargetSpec(c);
   return {
     land: false,
     reason: E.castBlockReason(g, p, c) || (spec && !E.legalTargets(g, p, spec).length ? 'No hay objetivos legales (CR 601.2c).' : null),
@@ -283,7 +285,16 @@ function decisionView(g, me, pending) {
     case 'priority':
       return { ...base, step: req.step, error: req.error, stack: req.stack };
     case 'attackers':
-      return { ...base, attackers: req.attackers.map(card), defenders: req.defenders.map((i) => ({ idx: i, name: g.players[i].name, life: g.players[i].life })) };
+      return {
+        ...base,
+        attackers: req.attackers.map(card),
+        defenders: req.defenders.map((i) => ({ idx: i, name: g.players[i].name, life: g.players[i].life })),
+        planeswalkers: (req.planeswalkers || []).map((iid) => {
+          const c = card(iid);
+          const loc = E.findCard(g, iid);
+          return { iid, name: c.name, loyalty: c.loyalty, controller: loc?.card.owner };
+        }),
+      };
     case 'blockers':
       return { ...base, options: req.options.map((o) => ({ attacker: card(o.attacker), menace: o.menace, blockers: o.blockers.map(card) })) };
     case 'target':

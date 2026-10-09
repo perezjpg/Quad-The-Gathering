@@ -52,7 +52,8 @@ Leyenda: ✅ implementado · 🟡 aproximado · ❌ no implementado
 | 701.6 Contrarrestar | ✅ | Apunta a un hechizo concreto de la pila |
 | 702.11b / 702.18 Hexproof / shroud | ✅ | |
 | 608.3 Los permanentes entran al resolver | ✅ | Con sus disparadores de "enters" |
-| 602 Habilidades activadas | 🟡 | "{T}: Create… / Draw…" (Krenko) y fetchlands usan la pila. Otras con coste de maná: ❌ |
+| 602 Habilidades activadas | ✅ | Costes de maná, {T}, pagar vida, sacrificar el permanente o "a creature/Goblin…" (eliges cuál), descartar. Usan la pila, eligen objetivos (602.2b), respetan "Activate only as a sorcery / once each turn" y el mareo con {T} (302.6). Ejemplos: Krenko, Goblin Bombardment, Clue, Food, fetchlands, "{2}: Create…". Solo se ofrecen las habilidades cuyo efecto el motor sabe resolver |
+| 603.3d Disparadores al entrar con objetivo | ✅ | "When ~ enters, destroy target…" (Ravenous Chupacabra): eliges el objetivo al entrar |
 
 ## 4. Estructura del turno (CR 500–514)
 
@@ -93,7 +94,9 @@ Leyenda: ✅ implementado · 🟡 aproximado · ❌ no implementado
 | 702.14 Forestwalk | ✅ | Otros landwalk: ❌ |
 | 702.90 Infectar / 702.80 Marchitar / 702.164 Tóxico | ✅ | |
 | "Can't be blocked" / "can't block" | ✅ | |
-| Atacar planeswalkers / batallas | ❌ | Solo se ataca a jugadores |
+| 506.3 / 508.1b Atacar planeswalkers | ✅ | En el modal de ataque eliges jugador o ◆ planeswalker. Bloquea el controlador del planeswalker. La IA manda las criaturas justas para matarlo |
+| 120.3c El daño a un planeswalker quita lealtad | ✅ | También el daño de hechizos a "any target"; no cuenta como daño de comandante |
+| Atacar batallas | ❌ | |
 | Protección, ward, flanqueo, bushido… | ❌ | |
 
 ## 6. Acciones basadas en estado (CR 704)
@@ -128,12 +131,26 @@ Leyenda: ✅ implementado · 🟡 aproximado · ❌ no implementado
 | 903.9b Mano/biblioteca → zona de mando (reemplazo) | 🟡 | Biblioteca sí; a la mano se queda en la mano |
 | 903.10a Daño de comandante | ✅ | |
 
+## 7b. Planeswalkers (CR 306, 606)
+
+| Regla | Estado | Detalle |
+|---|---|---|
+| 306.5b Entra con los contadores de lealtad impresos | ✅ | Se ve como ◆N en la carta |
+| 606.3 Una habilidad de lealtad por planeswalker y por turno, a velocidad de conjuro | ✅ | |
+| 606.4 El coste es poner o quitar contadores de lealtad | ✅ | +N, −N, 0 y −X (eliges X) |
+| 606.6 No se puede pagar un "−" mayor que la lealtad actual | ✅ | |
+| 704.5i Con 0 de lealtad va al cementerio | ✅ | |
+| IA | ✅ | Usa "−" para quitar amenazas si le quedan contadores; si no, la mejor habilidad "+" |
+| Emblemas | ❌ | Los efectos de emblema no se aplican |
+
 ## 8. Efectos leídos del texto Oracle (CR 608, 603, 614, 613)
 
 El motor no programa cada carta. Lee el texto Oracle y resuelve estos patrones:
 
 - **Efectos de hechizo y "enters":** robar, daño (a cualquier objetivo, a criaturas, a cada oponente), perder o ganar vida, destruir o exiliar un objetivo (respeta hexproof/shroud, CR 702.11 y 702.18), board wipes, `-X/-X` masivo, sacrificio forzado (Grave Pact), buscar tierras (Cultivate, Rampant Growth, fetchlands), contadores +1/+1 masivos y tokens de criatura con habilidades.
 - **Disparadores (603):** "When/Whenever … dies" (Blood Artist, Zulaport Cutthroat; mira hacia atrás, 603.10a), "deals combat damage to a player", ataque, mantenimiento y paso final. Se resuelven en orden APNAP (603.3b).
+- **Tokens avanzados:** X/X ("an X/X Hydra"), "for each land you control", "a number of … equal to the number of …", "where X is the number of Goblins you control", y disparadores "At the beginning of each upkeep / each end step" (Tendershoot Dryad).
+- **Robar según la mesa:** "draw cards equal to the greatest power among creatures you control / the number of …".
 - **Tokens de artefacto:** Treasure (se sacrifica al pagar con él), Clue y Food. Smothering Tithe te pregunta si pagas {2} cada vez que robas.
 - **Reemplazo de tokens (614):** Chatterfang ("plus that many Squirrels") y duplicadores ("twice that many").
 - **Efectos estáticos de "lords" (613):** "(Other) [Tipo] creatures you control get +N/+N".
@@ -151,7 +168,7 @@ Además, el menú de cada carta muestra su **coste real** con el desglose de mod
 
 ## ❌ No implementado (todavía)
 
-- Auras y equipos (se quedan en el campo sin efecto), habilidades de lealtad de planeswalker, copiar, robar el control, sagas.
-- Habilidades activadas con costes de maná (fuera de los Signets), habilidades de cementerio (flashback, unearth…).
+- Auras y equipos (se quedan en el campo sin efecto), copiar, robar el control, sagas, emblemas.
+- Habilidades desde el cementerio (flashback, unearth…) y costes poco comunes (exiliar del cementerio, quitar contadores).
 - Reglas multijugador opcionales: rango de influencia (801), atacar a la izquierda o a la derecha (803–804).
 - Elecciones del humano en la regla de leyenda y en el sacrificio forzado (se eligen automáticamente).

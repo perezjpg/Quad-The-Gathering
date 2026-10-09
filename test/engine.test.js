@@ -503,3 +503,182 @@ test('el análisis registra daño, hechizos, MVP e historial de vida', async () 
   assert.ok(an.lifeHistory.length >= 2);
   assert.ok(an.insights.some((t) => /más daño/.test(t)));
 });
+
+// ---------- Planeswalkers (CR 306, 606, 506.3, 120.3c) ----------
+
+const garruk = {
+  name: 'Garruk, Primal Hunter', typeLine: 'Legendary Planeswalker — Garruk', cmc: 5, manaCost: '{2}{G}{G}{G}', loyalty: '3', keywords: [],
+  oracle: '+1: Create a 3/3 green Beast creature token.\n−3: Draw cards equal to the greatest power among creatures you control.\n−6: Create a 6/6 green Wurm creature token for each land you control.',
+};
+const liliana = {
+  name: 'Liliana, Death Wielder', typeLine: 'Legendary Planeswalker — Liliana', cmc: 5, manaCost: '{3}{B}{B}', loyalty: '5', keywords: [],
+  oracle: '+2: Put a -1/-1 counter on up to one target creature.\n−3: Destroy target creature.\n−10: Return all creature cards from your graveyard to the battlefield.',
+};
+
+function putPW(g, p, info) {
+  const c = put(g, p, info);
+  c.counters.loyalty = +info.loyalty;
+  return c;
+}
+
+test('CR 606: +1 de Garruk crea una Bestia 3/3 y sube la lealtad; solo una vez por turno', async () => {
+  const g = newGame();
+  const a = g.players[0];
+  const w = putPW(g, a, garruk);
+  const abs = E.activatedAbilities(g, a, w);
+  assert.equal(abs.length, 3);
+  assert.equal(abs[0].loyalty, 1);
+  assert.ok((await E.activateAbility(g, a, w, 0, io)).ok);
+  await E.priorityLoop(g, io);
+  assert.equal(w.counters.loyalty, 4);
+  assert.ok(a.battlefield.some((c) => c.isToken && c.name.includes('Beast')));
+  const again = await E.activateAbility(g, a, w, 0, io);
+  assert.equal(again.ok, false);
+  assert.match(again.reason, /606\.3/);
+});
+
+test('CR 606.6: no se puede activar un "−" sin lealtad suficiente; CR 606.3 solo a velocidad de conjuro', () => {
+  const g = newGame();
+  const [a, b] = g.players;
+  const w = putPW(g, a, garruk);
+  assert.match(E.activatedAbilities(g, a, w)[2].reason, /606\.6/);
+  const theirs = putPW(g, b, garruk);
+  assert.match(E.activatedAbilities(g, b, theirs)[0].reason, /606\.3/); // no es su turno
+});
+
+test('−3 de Liliana destruye la criatura objetivo y Garruk −3 roba según la mayor fuerza', async () => {
+  const g = newGame();
+  const [a, b] = g.players;
+  const lili = putPW(g, a, liliana);
+  const bear = put(g, b, creature('Bear', '{2}', 2, 2));
+  assert.ok((await E.activateAbility(g, a, lili, 1, io, { target: { type: 'card', iid: bear.iid } })).ok);
+  await E.priorityLoop(g, io);
+  assert.ok(!b.battlefield.includes(bear));
+  assert.equal(lili.counters.loyalty, 2);
+  const gk = putPW(g, a, garruk);
+  gk.counters.loyalty = 3;
+  put(g, a, creature('Big', '{5}', 5, 5));
+  const hand = a.hand.length;
+  await E.activateAbility(g, a, gk, 1, io);
+  await E.priorityLoop(g, io);
+  assert.equal(a.hand.length, hand + 5);
+});
+
+test('CR 506.3 / 120.3c: atacar a un planeswalker le quita lealtad, no vida al jugador', async () => {
+  const g = newGame();
+  const [a, d] = g.players;
+  const w = putPW(g, d, garruk);
+  const atk = put(g, a, creature('Ogre', '{3}', 2, 2));
+  await E.combatPhase(g, a, makeIO({ attackers: [{ attacker: atk.iid, defender: d.idx, pw: w.iid }] }));
+  assert.equal(w.counters.loyalty, 1);
+  assert.equal(d.life, 40);
+  const atk2 = put(g, a, creature('Ogre 2', '{3}', 2, 2));
+  await E.combatPhase(g, a, makeIO({ attackers: [{ attacker: atk2.iid, defender: d.idx, pw: w.iid }] }));
+  assert.ok(!d.battlefield.includes(w)); // CR 704.5i
+});
+
+// ---------- Generadores de tokens y habilidades activadas (CR 602) ----------
+
+test('habilidad con coste de maná "{2}: Create…" paga y crea el token al resolverse', async () => {
+  const g = newGame();
+  const a = g.players[0];
+  const maker = put(g, a, spell('Token Factory', '{3}', 'Artifact', '{2}: Create a 1/1 colorless Thopter artifact creature token with flying.'));
+  put(g, a, forest);
+  put(g, a, forest);
+  assert.ok((await E.activateAbility(g, a, maker, 0, io)).ok);
+  await E.priorityLoop(g, io);
+  const t = a.battlefield.find((c) => c.isToken);
+  assert.ok(t && E.has(t, 'flying'));
+  assert.equal(a.battlefield.filter((c) => c.tapped).length, 2);
+  assert.match(E.activatedAbilities(g, a, maker)[0].reason, /Maná/);
+});
+
+test('outlet de sacrificio: "Sacrifice a creature: deals 1 damage to any target"', async () => {
+  const g = newGame();
+  const [a, b] = g.players;
+  const bomb = put(g, a, spell('Goblin Bombardment', '{1}{R}', 'Enchantment', 'Sacrifice a creature: Goblin Bombardment deals 1 damage to any target.'));
+  const goblin = put(g, a, creature('Goblin', '{1}', 1, 1));
+  const choose = makeIO({ target: (p, req) => (req.spec.type === 'sacrifice' ? { type: 'card', iid: goblin.iid } : { type: 'player', idx: b.idx }) });
+  assert.ok((await E.activateAbility(g, a, bomb, 0, choose)).ok);
+  await E.priorityLoop(g, choose);
+  assert.ok(!a.battlefield.includes(goblin));
+  assert.equal(b.life, 39);
+});
+
+test('Clue: "{2}, Sacrifice this token: Draw a card."', async () => {
+  const g = newGame();
+  const a = g.players[0];
+  E.resolveText(g, a, 'Create a Clue token.');
+  put(g, a, forest);
+  put(g, a, forest);
+  const clue = a.battlefield.find((c) => c.name === 'Clue');
+  const hand = a.hand.length;
+  assert.ok((await E.activateAbility(g, a, clue, 0, io)).ok);
+  await E.priorityLoop(g, io);
+  assert.equal(a.hand.length, hand + 1);
+  assert.ok(!a.battlefield.includes(clue));
+});
+
+test('tokens "for each" y "equal to the number of"', () => {
+  const g = newGame();
+  const a = g.players[0];
+  for (let i = 0; i < 3; i++) put(g, a, forest);
+  E.resolveText(g, a, 'Create a 6/6 green Wurm creature token for each land you control.');
+  assert.equal(a.battlefield.filter((c) => c.name.includes('Wurm')).length, 3);
+  E.resolveText(g, a, 'Create a number of 1/1 green Saproling creature tokens equal to the number of lands you control.');
+  assert.equal(a.battlefield.filter((c) => c.name.includes('Saproling')).length, 3);
+  E.resolveText(g, a, 'Create an X/X green Hydra creature token.', { x: 4 });
+  assert.ok(a.battlefield.some((c) => c.name === 'Hydra 4/4'));
+});
+
+test('"At the beginning of each upkeep" se dispara también en el turno rival', async () => {
+  const g = newGame();
+  const [a, b] = g.players;
+  put(g, b, creature('Tendershoot Dryad', '{4}{G}', 2, 2, [], 'Ascend\nAt the beginning of each upkeep, create a 1/1 green Saproling creature token.'));
+  await E.takeTurn(g, io); // turno de A
+  assert.equal(b.battlefield.filter((c) => c.isToken).length, 1);
+});
+
+test('fetchland con el nuevo parser: paga 1 vida, se sacrifica y busca', async () => {
+  const g = newGame();
+  const a = g.players[0];
+  const fetch = put(g, a, { name: 'Wooded Foothills', typeLine: 'Land', cmc: 0, manaCost: '', keywords: [], oracle: '{T}, Pay 1 life, Sacrifice Wooded Foothills: Search your library for a Mountain or Forest card, put it onto the battlefield, then shuffle.' });
+  assert.ok((await E.activateAbility(g, a, fetch, 0, io)).ok);
+  await E.priorityLoop(g, io);
+  assert.equal(a.life, 39);
+  assert.ok(!a.battlefield.includes(fetch));
+  assert.ok(a.battlefield.some((c) => c.name === 'Forest'));
+});
+
+test('partida de 4 IAs con planeswalkers y generadores de tokens termina sin errores', async () => {
+  const pwDeck = (n) => [...deck(`Cmdr ${n}`).map((e) => (e.info.name === 'Divination' ? { ...e, qty: 4 } : e)),
+    { info: garruk, qty: 1, board: 'main' }, { info: liliana, qty: 1, board: 'main' },
+    { info: spell('Token Factory', '{3}', 'Artifact', '{2}: Create a 1/1 colorless Thopter artifact creature token with flying.'), qty: 3, board: 'main' }];
+  const s = new GameSession(['A', 'B', 'C', 'D'].map((n) => ({ name: n, isAI: true, entries: pwDeck(n) })));
+  s.io.step = async () => {};
+  await s.run();
+  assert.equal(s.error, null);
+  assert.notEqual(s.game.winner, null, `sin ganador tras ${s.game.turn} turnos`);
+  assert.ok(s.game.log.some((l) => /Garruk|Liliana|Token Factory/.test(l.msg)), 'la IA debería usar planeswalkers o generadores');
+});
+
+test('CR 601.2c: un planeswalker con "−3: Destroy target creature" se puede lanzar sin objetivos en mesa', async () => {
+  const g = newGame();
+  const a = g.players[0];
+  for (let i = 0; i < 5; i++) put(g, a, forest);
+  const lili = put(g, a, { ...liliana, manaCost: '{5}' }, 'hand');
+  assert.equal(E.castBlockReason(g, a, lili), null);
+  assert.ok((await castAndResolve(g, a, lili)).ok);
+  assert.ok(a.battlefield.includes(lili));
+  assert.equal(lili.counters.loyalty, 5); // CR 306.5b: entra con su lealtad impresa
+});
+
+test('CR 603.3d: "When ~ enters, destroy target creature" elige objetivo al entrar', async () => {
+  const g = newGame();
+  const [a, b] = g.players;
+  for (let i = 0; i < 4; i++) put(g, a, forest);
+  const bear = put(g, b, creature('Bear', '{2}', 2, 2));
+  const chupa = put(g, a, creature('Ravenous Chupacabra', '{4}', 2, 2, [], 'When Ravenous Chupacabra enters, destroy target creature an opponent controls.'), 'hand');
+  await castAndResolve(g, a, chupa, makeIO({ target: { type: 'card', iid: bear.iid } }));
+  assert.ok(!b.battlefield.includes(bear));
+});
