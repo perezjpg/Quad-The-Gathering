@@ -414,3 +414,51 @@ body.playing .hero, body.playing .foot { display: none; }
 .target-btn { display: flex; align-items: center; gap: 10px; background: var(--bg); border: 1px solid var(--line); border-radius: 10px; padding: 6px 10px; cursor: pointer; text-align: left; }
 .target-btn:hover { border-color: var(--ok); }
 .modal .row-btns { flex-wrap: wrap; }
+
+/* ---------- Mesa en cruz (4 jugadores, como en el video) ---------- */
+.table-grid.cross {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.6fr) minmax(0, 1fr);
+  grid-template-areas: "top top top" "left center right";
+  gap: 10px;
+  align-items: start;
+}
+.cross .slot-top { grid-area: top; }
+.cross .slot-left { grid-area: left; }
+.cross .slot-right { grid-area: right; }
+.cross > .center { grid-area: center; align-self: center; min-width: 0; }
+.mat.side { padding: 8px; border-radius: 16px; max-height: 460px; overflow-y: auto; scrollbar-width: thin; }
+.mat.side .mat-head { gap: 4px; }
+.mat.side .pill { font-size: 10px; padding: 2px 8px; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mat.side .mana-colors, .mat.side .life-btn { display: none; }
+.mat.side .zones { margin-left: 0; gap: 4px; font-size: 11px; flex-wrap: wrap; }
+.mat.side .mat-body { flex-direction: column; gap: 6px; }
+.mat.side .command-zone { width: auto; min-height: 0; flex-direction: row; flex-wrap: wrap; justify-content: flex-start; padding: 4px 6px; }
+.mat.side .cz-label { writing-mode: horizontal-tb; align-self: center; }
+.land-chips { display: flex; flex-wrap: wrap; gap: 4px; }
+.land-chip { font-size: 10px; background: rgba(0, 0, 0, 0.35); border: 1px solid var(--line); border-radius: 999px; padding: 2px 7px; white-space: nowrap; }
+.land-chip small { color: var(--muted); }
+.cross .steps { flex-wrap: wrap; justify-content: center; }
+.cross .banner { padding: 6px 14px; }
+@media (max-width: 700px) {
+  .table-grid.cross { grid-template-columns: minmax(0, 1fr) minmax(0, 1.15fr) minmax(0, 1fr); gap: 6px; }
+  .mat.side { padding: 6px; max-height: 340px; }
+  .mat.side .mana-badge { display: none; }
+  .cross .steps li { font-size: 8px; padding: 2px 5px; }
+  .cross .banner span { font-size: 13px; }
+  .cross .banner small { font-size: 10px; }
+}
+
+/* ---------- Análisis de la partida ---------- */
+.analysis h4 { margin: 14px 0 6px; font-size: 14px; color: var(--muted); }
+.insights { margin: 6px 0 0; padding-left: 18px; display: flex; flex-direction: column; gap: 4px; }
+.life-chart { width: 100%; height: auto; background: var(--bg); border: 1px solid var(--line); border-radius: 10px; }
+.life-chart .grid { stroke: var(--line); stroke-width: 1; }
+.life-chart text { fill: var(--muted); font-size: 11px; }
+.legend { display: flex; flex-wrap: wrap; gap: 12px; font-size: 12px; margin-top: 6px; }
+.legend i { display: inline-block; width: 12px; height: 4px; border-radius: 2px; margin-right: 5px; vertical-align: middle; }
+.stats-table-wrap { overflow-x: auto; }
+.stats-table { width: 100%; border-collapse: collapse; font-size: 13px; min-width: 420px; }
+.stats-table th, .stats-table td { padding: 6px 8px; border-bottom: 1px solid var(--bg-3); text-align: center; }
+.stats-table td:first-child { text-align: left; color: var(--muted); white-space: nowrap; }
+.stats-table tbody tr:hover { background: var(--bg-3); }

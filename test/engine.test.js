@@ -481,3 +481,25 @@ test('la vista de un jugador oculta las manos rivales', () => {
   assert.equal(v.players[1].hand, null);
   assert.equal(v.players[1].handCount, 7);
 });
+
+// ---------- Análisis de la partida ----------
+
+import { matchAnalysis } from '../public/lib/analysis.js';
+
+test('el análisis registra daño, hechizos, MVP e historial de vida', async () => {
+  const g = newGame();
+  const [a, d] = g.players;
+  for (let i = 0; i < 3; i++) put(g, a, forest);
+  await castAndResolve(g, a, put(g, a, divination, 'hand'));
+  const atk = put(g, a, creature('Wurm', '{4}', 6, 6));
+  await E.combatPhase(g, a, makeIO({ attackers: [{ attacker: atk.iid, defender: d.idx }] }));
+  await E.takeTurn(g, io);
+  const an = matchAnalysis(g);
+  const pa = an.players[0];
+  assert.equal(pa.spells, 1);
+  assert.equal(pa.manaSpent, 3);
+  assert.equal(pa.combatDamage, 6);
+  assert.deepEqual(pa.mvp, { name: 'Wurm', damage: 6 });
+  assert.ok(an.lifeHistory.length >= 2);
+  assert.ok(an.insights.some((t) => /más daño/.test(t)));
+});

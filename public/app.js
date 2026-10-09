@@ -559,7 +559,21 @@ function groupLands(cards) {
   return [...groups.values()];
 }
 
-function matHTML(v, p, isYou) {
+/** Tierras en formato compacto para los jugadores laterales: "5× Forest (2 giradas)". */
+function landChips(lands) {
+  const groups = new Map();
+  for (const c of lands) {
+    const g = groups.get(c.name) || { name: c.name, n: 0, tapped: 0, iid: c.iid };
+    g.n++;
+    if (c.tapped) g.tapped++;
+    groups.set(c.name, g);
+  }
+  return [...groups.values()]
+    .map((g) => `<span class="land-chip" title="${esc(g.name)}">${g.n}× ${esc(g.name)}${g.tapped ? ` <small>(${g.tapped}↻)</small>` : ''}</span>`)
+    .join('');
+}
+
+function matHTML(v, p, isYou, { side = false, slot = '' } = {}) {
   const active = v.active === p.idx && v.winner == null;
   const attacking = new Set(v.combat.map((a) => a.attacker));
   const blocking = new Set(v.combat.flatMap((a) => a.blockers));
@@ -570,7 +584,7 @@ function matHTML(v, p, isYou) {
   const small = !isYou;
   const canLife = state.client?.isHost;
   return `
-  <section class="mat ${isYou ? 'you' : 'opp'} ${active ? 'active' : ''} ${p.alive ? '' : 'dead'} ${v.winner === p.idx ? 'winner' : ''}" style="--pc:${p.color}">
+  <section class="mat ${isYou ? 'you' : 'opp'} ${side ? 'side' : ''} ${slot} ${active ? 'active' : ''} ${p.alive ? '' : 'dead'} ${v.winner === p.idx ? 'winner' : ''}" style="--pc:${p.color}">
     <div class="mat-head">
       <span class="pill">${esc(p.name)}${p.isAI ? ' <small>IA</small>' : ''}</span>
       <span class="life-wrap">
@@ -596,7 +610,11 @@ function matHTML(v, p, isYou) {
       <div class="field">
         <div class="row creatures">${creatures.map((c) => cardHTML(c, { small, zone: 'battlefield', extraClass: cls(c) })).join('')}</div>
         <div class="row others">${others.map((c) => cardHTML(c, { small, zone: 'battlefield' })).join('')}</div>
-        <div class="row lands">${groupLands(lands).map((g) => cardHTML(g[0], { small: true, zone: 'battlefield', count: g.length })).join('')}</div>
+        ${
+          side
+            ? `<div class="land-chips">${landChips(lands)}</div>`
+            : `<div class="row lands">${groupLands(lands).map((g) => cardHTML(g[0], { small: true, zone: 'battlefield', count: g.length })).join('')}</div>`
+        }
       </div>
     </div>
     ${
@@ -634,8 +652,8 @@ function toolbarHTML(v) {
   const me = v.players[v.you];
   if (v.winner != null) {
     return state.client.isHost
-      ? `<button class="btn primary" data-act="rematch">↻ Revancha</button><button class="btn ghost" data-act="back">Salir</button>`
-      : `<span class="mana">Fin de la partida</span><button class="btn ghost" data-act="back">Salir</button>`;
+      ? `<button class="btn ghost" data-act="analysis">📊 Análisis</button><button class="btn primary" data-act="rematch">↻ Revancha</button><button class="btn ghost" data-act="back">Salir</button>`
+      : `<button class="btn ghost" data-act="analysis">📊 Análisis</button><button class="btn ghost" data-act="back">Salir</button>`;
   }
   if (d?.kind === 'priority') {
     const myTurn = v.active === v.you;
@@ -659,14 +677,20 @@ function renderTable() {
   const root = $('#table');
   const you = v.players[v.you];
   const opps = v.players.filter((p) => p.idx !== v.you);
-  const b = v.banner;
   const host = state.client?.isHost;
+  // Mesa en cruz como en el video (4 jugadores): el siguiente en el orden de turno a tu izquierda,
+  // el de enfrente arriba y el anterior a tu derecha.
+  const n = v.players.length;
+  const cross = n === 4;
+  const seat = (k) => v.players[(v.you + k) % n];
+  const { centerHTML, logHTML } = centerParts(v);
 
   root.innerHTML = `
     <header class="table-head">
       <button class="btn ghost small" data-act="back">← Salir</button>
       <div class="title"><h1>COMMANDER TABLE</h1><span>TURN ${v.turn}</span></div>
       <div class="table-ctrl">
+        <button class="btn ghost small" data-act="analysis" title="Análisis de la partida">📊</button>
         ${
           host
             ? `<select data-setting="speed" aria-label="Velocidad">${Object.keys(SPEEDS)
@@ -679,8 +703,97 @@ function renderTable() {
       </div>
     </header>
     ${v.effects.length ? `<div class="effects" aria-label="Efectos activos que te afectan">${v.effects.map((e) => `<span class="effect">${e.icon} ${esc(e.text)}</span>`).join('')}</div>` : ''}
-    <div class="opps n${opps.length}">${opps.map((p) => matHTML(v, p, false)).join('')}</div>
-    <div class="center">
+    ${
+      cross
+        ? `<div class="table-grid cross">
+            ${matHTML(v, seat(2), false, { slot: 'slot-top' })}
+            ${matHTML(v, seat(1), false, { side: true, slot: 'slot-left' })}
+            ${centerHTML}
+            ${matHTML(v, seat(3), false, { side: true, slot: 'slot-right' })}
+          </div>`
+        : `<div class="opps n${opps.length}">${opps.map((p) => matHTML(v, p, false)).join('')}</div>${centerHTML}`
+    }
+    ${logHTML}
+    ${matHTML(v, you, true)}
+    <nav class="toolbar">${toolbarHTML(v)}</nav>`;
+  syncDecision(v);
+  // Al terminar la partida, mostrar el análisis una vez
+  if (v.winner == null) state.analysisShown = false;
+  else if (!state.analysisShown && !v.decision) {
+    state.analysisShown = true;
+    openAnalysis();
+  }
+}
+
+// ---------- Análisis de la partida ----------
+
+function lifeChartSVG(an) {
+  const hist = an.lifeHistory;
+  if (hist.length < 2) return '<p class="hint">La gráfica aparece después del primer turno.</p>';
+  const W = 640;
+  const H = 220;
+  const pad = { l: 34, r: 12, t: 12, b: 26 };
+  const maxLife = Math.max(40, ...hist.flatMap((h) => h.lives));
+  const x = (i) => pad.l + (i * (W - pad.l - pad.r)) / (hist.length - 1);
+  const y = (life) => pad.t + (1 - life / maxLife) * (H - pad.t - pad.b);
+  const grid = [0, 10, 20, 30, 40]
+    .filter((g) => g <= maxLife)
+    .map((g) => `<line x1="${pad.l}" x2="${W - pad.r}" y1="${y(g)}" y2="${y(g)}" class="grid"/><text x="${pad.l - 6}" y="${y(g) + 4}" text-anchor="end">${g}</text>`)
+    .join('');
+  const turns = hist
+    .map((h, i) => ({ h, i }))
+    .filter(({ h, i }) => i === 0 || h.turn !== hist[i - 1].turn)
+    .map(({ h, i }) => `<text x="${x(i)}" y="${H - 8}" text-anchor="middle">T${h.turn}</text>`)
+    .join('');
+  const lines = an.players
+    .map((p) => {
+      const pts = hist.map((h, i) => `${x(i).toFixed(1)},${y(h.lives[p.idx]).toFixed(1)}`).join(' ');
+      return `<polyline points="${pts}" fill="none" stroke="${p.color}" stroke-width="2.5" stroke-linejoin="round"><title>${esc(p.name)}</title></polyline>`;
+    })
+    .join('');
+  return `<svg class="life-chart" viewBox="0 0 ${W} ${H}" role="img" aria-label="Vida de cada jugador por turno">${grid}${turns}${lines}</svg>
+    <div class="legend">${an.players.map((p) => `<span><i style="background:${p.color}"></i>${esc(p.name)}</span>`).join('')}</div>`;
+}
+
+function analysisHTML(an) {
+  const rows = [
+    ['Vida', (p) => (p.alive ? p.life : `☠ T${p.eliminatedTurn}`)],
+    ['Daño total', (p) => p.totalDamage],
+    ['· en combate', (p) => p.combatDamage],
+    ['· otros efectos', (p) => p.otherDamage],
+    ['Golpe más fuerte', (p) => p.biggestHit],
+    ['Daño de comandante recibido', (p) => p.cmdTaken],
+    ['Hechizos lanzados', (p) => p.spells],
+    ['Maná gastado', (p) => p.manaSpent],
+    ['Tierras jugadas', (p) => p.landsPlayed],
+    ['Cartas robadas', (p) => p.draws],
+    ['Removal / contrahechizos', (p) => `${p.removal} / ${p.counters}`],
+    ['Criaturas perdidas', (p) => p.creaturesLost],
+    ['Vida ganada', (p) => p.lifeGained],
+    ['Fuerza en mesa', (p) => p.boardPower],
+    ['Carta MVP', (p) => (p.mvp ? `${esc(p.mvp.name)} (${p.mvp.damage})` : '—')],
+  ];
+  return `
+    <h3>📊 Análisis de la partida · Turno ${an.turn}</h3>
+    <ul class="insights">${an.insights.map((t) => `<li>${esc(t)}</li>`).join('') || '<li>Aún no pasa nada relevante.</li>'}</ul>
+    <h4>❤️ Vida por turno</h4>
+    ${lifeChartSVG(an)}
+    <h4>📋 Estadísticas</h4>
+    <div class="stats-table-wrap"><table class="stats-table">
+      <thead><tr><th></th>${an.players.map((p) => `<th style="color:${p.color}">${esc(p.name)}${an.winner === p.idx ? ' 🏆' : ''}</th>`).join('')}</tr></thead>
+      <tbody>${rows.map(([label, fn]) => `<tr><td>${label}</td>${an.players.map((p) => `<td>${fn(p)}</td>`).join('')}</tr>`).join('')}</tbody>
+    </table></div>`;
+}
+
+function openAnalysis() {
+  const an = state.view?.analysis;
+  if (!an) return;
+  openModal(`<div class="analysis">${analysisHTML(an)}</div>`);
+}
+
+function centerParts(v) {
+  const b = v.banner;
+  const centerHTML = `<div class="center">
       ${stepBarHTML(v)}
       ${
         v.winner != null
@@ -692,11 +805,11 @@ function renderTable() {
       ${v.stack.length ? `<div class="stack-zone" title="La pila (CR 405) — se resuelve de arriba hacia abajo">📚 PILA: ${v.stack.slice().reverse().map((it) => `<b>${esc(it.name)}</b>${it.target ? ` → ${esc(it.target)}` : ''} <small>(${esc(it.controller)})</small>`).join(' · ')}</div>` : ''}
       ${v.error ? `<div class="warn small">Error del motor: ${esc(v.error)}</div>` : ''}
       <div class="turn-line" style="--pc:${v.players[v.active].color}"></div>
-      <details class="log"><summary>Registro (${v.log.length})</summary><ol>${v.log.map((l) => `<li><b>T${l.turn}</b> ${esc(l.msg)}</li>`).join('')}</ol></details>
-    </div>
-    ${matHTML(v, you, true)}
-    <nav class="toolbar">${toolbarHTML(v)}</nav>`;
-  syncDecision(v);
+    </div>`;
+  const logHTML = `<details class="log"><summary>Registro (${v.log.length})</summary><ol>${v.log
+    .map((l) => `<li><b>T${l.turn}</b> ${esc(l.msg)}</li>`)
+    .join('')}</ol></details>`;
+  return { centerHTML, logHTML };
 }
 
 // ---------- Decisiones (modales) ----------
@@ -1062,6 +1175,7 @@ function bindTable() {
         return backToSetup();
       }
       if (act === 'rematch') return state.client.rematch();
+      if (act === 'analysis') return openAnalysis();
       if (act === 'pause') return state.client.send({ type: 'setting', paused: !v.paused });
       if (act === 'stops') return state.client.send({ type: 'setting', fullStops: !v.fullStops });
       if (act === 'pass') return answer({ type: 'pass' });

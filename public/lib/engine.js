@@ -8,7 +8,7 @@
 //   io.decide(player, req) -> Promise<value>   decisiones humanas (req es serializable)
 
 import { isLand, isCreature } from './stats.js';
-import { parseCost, manaSources, planPayment, COLORS } from './mana.js';
+import { parseCost, costTotal, manaSources, planPayment, COLORS } from './mana.js';
 
 export const STARTING_LIFE = 40; // CR 903.7
 export const COMMANDER_DAMAGE_LETHAL = 21; // CR 704.6c / 903.10a
@@ -179,6 +179,7 @@ export function createGame(configs, settings = {}) {
       alive: true,
       drewFromEmpty: false,
       mulligans: 0,
+      stats: newStats(),
       autoPassTurn: -1,
       aiTurn: -1,
       lastError: null,
@@ -199,13 +200,39 @@ export function createGame(configs, settings = {}) {
     winner: null,
     banner: null,
     pendingTriggers: [],
+    lifeHistory: [],
     settings: { fullStops: false, ...settings },
     aborted: false,
   };
   game.firstPlayer = game.active;
   for (const p of players) for (let i = 0; i < 7 && p.library.length; i++) p.hand.push(p.library.shift()); // CR 103.4
+  snapshotLife(game, 'Inicio');
   log(game, `🎲 ${players[game.active].name} empieza la partida (CR 103.1).`);
   return game;
+}
+
+// ---------- Estadísticas de la partida ----------
+
+function newStats() {
+  return {
+    spells: 0, manaSpent: 0, lands: 0, draws: 0, combatDamage: 0, otherDamage: 0, biggestHit: 0,
+    creaturesLost: 0, removal: 0, counters: 0, lifeGained: 0, sources: {}, eliminatedTurn: null, eliminatedReason: null,
+  };
+}
+
+function creditDamage(game, ownerIdx, sourceName, amount, combat) {
+  const st = game.players[ownerIdx]?.stats;
+  if (!st || amount <= 0) return;
+  if (combat) st.combatDamage += amount;
+  else st.otherDamage += amount;
+  st.biggestHit = Math.max(st.biggestHit, amount);
+  if (sourceName) st.sources[sourceName] = (st.sources[sourceName] || 0) + amount;
+}
+
+/** Guarda la vida de todos en este momento (para la gráfica de la partida). */
+export function snapshotLife(game, label) {
+  game.lifeHistory.push({ turn: game.turn, label, lives: game.players.map((p) => Math.max(0, p.life)) });
+  if (game.lifeHistory.length > 400) game.lifeHistory.shift();
 }
 
 export function log(game, msg) {
@@ -228,6 +255,7 @@ export function draw(game, p, n = 1) {
       break;
     }
     p.hand.push(c);
+    p.stats.draws++;
     game.pendingTriggers.push({ type: 'draw', player: p.idx });
   }
   runSBA(game);
@@ -310,6 +338,7 @@ export function moveCard(game, card, toZone, { position = 'top' } = {}) {
   else loc.player[loc.zone].splice(loc.index, 1);
 
   if (fromBattlefield && toZone === 'graveyard' && isCreature(card)) {
+    if (game.players[card.owner]) game.players[card.owner].stats.creaturesLost++;
     game.pendingTriggers.push({ type: 'dies', card: { ...card }, controller: card.owner }); // CR 700.4
   }
   if (game.combat) game.combat.remove(card);
@@ -572,6 +601,7 @@ export function playLand(game, p, card) {
   moveCard(game, card, 'battlefield'); // CR 305.1: jugar tierra no usa la pila
   if (/enters( the battlefield)? tapped/i.test(card.oracle || '') && !/unless/i.test(card.oracle || '')) card.tapped = true;
   p.landsPlayed++;
+  p.stats.lands++;
   log(game, `🌲 ${p.name} juega ${card.name}.`);
   return { ok: true };
 }
@@ -605,6 +635,8 @@ export async function castSpell(game, p, card, io, { x = 0, target } = {}) {
   if (!payCost(game, p, cost, x)) return { ok: false, reason: `Maná insuficiente para ${costText(cost, x)} (CR 601.2h).` };
   const fromCommand = p.command.includes(card);
   if (fromCommand) p.commanderTax[card.iid] = (p.commanderTax[card.iid] || 0) + 2;
+  p.stats.spells++;
+  p.stats.manaSpent += costTotal(cost, x);
 
   const loc = findCard(game, card.iid);
   loc.player[loc.zone].splice(loc.index, 1);
@@ -752,6 +784,7 @@ function stillLegal(game, item) {
 
 function labelFor(effects, item) {
   if (effects.some((e) => e.startsWith('BOARD WIPE'))) return 'BOARD WIPE';
+  if (effects.some((e) => / sacrifica /.test(e))) return 'SACRIFICE';
   if (effects.some((e) => e.startsWith('contrarresta'))) return 'COUNTER';
   if (effects.some((e) => /destruye|exilia/.test(e))) return 'REMOVAL';
   if (effects.some((e) => e.startsWith('crea'))) return 'TOKENS';
@@ -772,6 +805,7 @@ export function resolveText(game, p, text, { source = null, x = 0, target = null
     game.stack.splice(game.stack.indexOf(it), 1);
     if (it.kind === 'spell' && !it.card.isToken) game.players[it.card.owner].graveyard.push(it.card); // CR 701.6a
     out.push(`contrarresta ${it.card.name}`);
+    p.stats.counters++;
   }
 
   // Board wipes
@@ -798,6 +832,7 @@ export function resolveText(game, p, text, { source = null, x = 0, target = null
     if (m[1] === 'destroy' && has(c, 'indestructible')) out.push(`${c.name} es indestructible`);
     else {
       moveCard(game, c, m[1] === 'exile' ? 'exile' : 'graveyard');
+      p.stats.removal++;
       out.push(`${m[1] === 'exile' ? 'exilia' : 'destruye'} ${c.name}`);
     }
   }
@@ -805,15 +840,20 @@ export function resolveText(game, p, text, { source = null, x = 0, target = null
   // Daño
   if ((m = t.match(/deals? (\d+|x) damage to each opponent/))) {
     const n = num(m[1], x);
-    for (const o of opponents(game, p)) o.life -= n;
+    for (const o of opponents(game, p)) {
+      o.life -= n;
+      creditDamage(game, p.idx, source?.name, n, false);
+    }
     out.push(`${n} de daño a cada oponente`);
   } else if ((m = t.match(/deals? (\d+|x) damage to the player or planeswalker it's attacking/)) && defender) {
     defender.life -= num(m[1], x);
+    creditDamage(game, p.idx, source?.name, num(m[1], x), false);
     out.push(`${num(m[1], x)} de daño a ${defender.name}`);
   } else if ((m = t.match(/deals? (\d+|x) damage to (?:any target|target [a-z ]+)/)) && tgt) {
     const n = num(m[1], x);
     if (tgt.type === 'player') {
       tgt.player.life -= n;
+      if (tgt.player !== p) creditDamage(game, p.idx, source?.name, n, false);
       out.push(`${n} de daño a ${tgt.player.name}`);
     } else if (tgt.type === 'card') {
       tgt.card.damage += n;
@@ -824,17 +864,22 @@ export function resolveText(game, p, text, { source = null, x = 0, target = null
 
   // Pérdida de vida / drenaje
   if ((m = t.match(/each opponent loses (\d+) life/))) {
-    for (const o of opponents(game, p)) o.life -= +m[1];
+    for (const o of opponents(game, p)) {
+      o.life -= +m[1];
+      creditDamage(game, p.idx, source?.name, +m[1], false);
+    }
     out.push(`cada oponente pierde ${m[1]}`);
   } else if ((m = t.match(/target (?:player|opponent) loses (\d+) life/))) {
     const o = weakestOpponent(game, p);
     if (o) {
       o.life -= +m[1];
+      creditDamage(game, p.idx, source?.name, +m[1], false);
       out.push(`${o.name} pierde ${m[1]}`);
     }
   }
   if ((m = t.match(/you gain (\d+) life/))) {
     p.life += +m[1];
+    p.stats.lifeGained += +m[1];
     out.push(`+${m[1]} vida`);
   }
 
@@ -1091,6 +1136,8 @@ export function runSBA(game) {
 export function eliminate(game, p, reason) {
   if (!p.alive) return;
   p.alive = false;
+  p.stats.eliminatedTurn = game.turn;
+  p.stats.eliminatedReason = reason;
   for (const c of p.battlefield) game.combat?.remove(c);
   p.battlefield = []; // CR 800.4a
   game.stack = game.stack.filter((it) => it.controller !== p);
@@ -1098,6 +1145,7 @@ export function eliminate(game, p, reason) {
   const alive = game.players.filter((x) => x.alive);
   if (alive.length === 1 && game.winner == null) {
     game.winner = alive[0].idx;
+    snapshotLife(game, 'Final');
     log(game, `🏆 ¡${alive[0].name} gana la partida! (CR 104.2a)`);
   }
 }
@@ -1226,6 +1274,7 @@ export async function takeTurn(game, io) {
     return false;
   };
   game.turnId++;
+  snapshotLife(game, p.name);
   for (const pl of game.players) pl.castsThisTurn = [];
   p.landsPlayed = 0;
 
@@ -1543,6 +1592,7 @@ export function dealCombatDamage(game, combat, stage) {
       else pl.life -= ev.amount;
       if ((src.keywords || []).some((k) => /^toxic/i.test(k))) pl.poison += parseInt((src.oracle || '').match(/Toxic (\d+)/i)?.[1] || '1', 10); // CR 702.164
       if (src.isCommander) pl.commanderDamage[src.iid] = (pl.commanderDamage[src.iid] || 0) + ev.amount; // CR 903.10a
+      creditDamage(game, src.owner, src.isToken ? 'Tokens' : src.name, ev.amount, true);
       toPlayers.set(pl.name, (toPlayers.get(pl.name) || 0) + ev.amount);
       for (const m of (src.oracle || '').matchAll(/whenever [^,]*? deals combat damage to a player, ([^.\n]+)/gi)) {
         resolveText(game, ctrl, m[1], { source: src, defender: pl });
@@ -1553,7 +1603,10 @@ export function dealCombatDamage(game, combat, stage) {
       else c.damage += ev.amount;
       if (has(src, 'deathtouch')) c.deathtouched = true; // CR 702.2b
     }
-    if (has(src, 'lifelink')) ctrl.life += ev.amount; // CR 702.15b
+    if (has(src, 'lifelink')) {
+      ctrl.life += ev.amount; // CR 702.15b
+      ctrl.stats.lifeGained += ev.amount;
+    }
   }
   runSBA(game);
   const parts = [...toPlayers].map(([n, d]) => `${n} −${d}`);

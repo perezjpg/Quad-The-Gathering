@@ -3,6 +3,7 @@
 
 import * as E from './engine.js';
 import { isLand, isCreature } from './stats.js';
+import { matchAnalysis } from './analysis.js';
 
 export const SPEEDS = { lenta: 1300, normal: 750, rápida: 280, turbo: 40 };
 
@@ -198,6 +199,7 @@ export class GameSession {
       effects: me ? E.activeEffects(g, me) : [],
       decision: pending ? decisionView(g, me, pending) : null,
       waitingOn: [...this.pending.keys()].map((i) => g.players[i].name),
+      analysis: matchAnalysis(g),
     };
   }
 }
